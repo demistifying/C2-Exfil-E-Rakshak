@@ -1,0 +1,17 @@
+[
+  {
+    "kind": "exfil",
+    "dst_ip": "162.241.123.75",
+    "dst_port": 21,
+    "timestamp": "2026-02-03T16:14:01.435956+00:00",
+    "confidence": 0.8,
+    "reputation_hit": false,
+    "geo_country": null,
+    "asn": null,
+    "asn_org": null,
+    "http_uri": "STOR PW_tyler-DESKTOP-W7F98GR_2026_02_03_16_13_59.html",
+    "destination_domain": null,
+    "ja3_hash": null,
+    "plaintext_available": true
+  }
+]

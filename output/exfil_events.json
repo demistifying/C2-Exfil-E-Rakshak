@@ -1,0 +1,22 @@
+[
+  {
+    "event_id": "3ead4ee4-469f-4e2e-b933-b2c97ae6f311",
+    "sample_id": "2fa7e8b80d9f0b460b98ed053fbfc9710ff21a4b689b16acb58e0cdc13bf9769",
+    "platform": "windows",
+    "timestamp": "2026-02-03T16:14:01.435956+00:00",
+    "data_type_accessed": null,
+    "access_api_call": null,
+    "destination_ip": "162.241.123.75",
+    "destination_port": 21,
+    "destination_domain": null,
+    "asn": null,
+    "geo_country": null,
+    "reputation_score": 0.0,
+    "ja3_hash": null,
+    "plaintext_available": true,
+    "confidence_score": 0.8,
+    "confidence_tier": "weak",
+    "mitre_technique_id": "T1041",
+    "evidence_hash": "51f52f485a464d9fc4f6ff1aadc3d5eb7cbdac4a5813350764c610c51f5c81dd"
+  }
+]
