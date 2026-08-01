@@ -1,0 +1,20 @@
+[
+  {
+    "timestamp": "2026-07-14T21:03:26.366315+00:00",
+    "data_type": "browser_credentials",
+    "api_call": "CryptUnprotectData",
+    "process": "stealer.exe"
+  },
+  {
+    "timestamp": "2026-07-14T21:03:27.366315+00:00",
+    "data_type": "keystrokes",
+    "api_call": "SetWindowsHookEx(WH_KEYBOARD_LL)",
+    "process": "stealer.exe"
+  },
+  {
+    "timestamp": "2026-07-14T21:02:00.366315+00:00",
+    "data_type": "screenshot",
+    "api_call": "BitBlt",
+    "process": "stealer.exe"
+  }
+]

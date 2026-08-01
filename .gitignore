@@ -1,8 +1,32 @@
-# Python
+# ============================================================
+# E-Rakshak Windows C2/Exfiltration Module — .gitignore
+# ============================================================
+
+# ---------- Packet captures & datasets ----------
+# Never commit raw traffic — too large, and potentially contains PII.
+*.pcap
+*.pcapng
+*.cap
+*.crdownload
+data/
+
+# KEEP these two small fixtures (force-tracked below via `git add -f`):
+#   data/ground_truth.json
+#   data/access_events_fixture.json
+
+# ---------- Generated / regenerable artifacts ----------
+output/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+
+# ---------- Threat-intel DB (regenerable via feed_import.py) ----------
+*.sqlite
+*.sqlite-journal
+
+# ---------- Python packaging ----------
 .Python
 env/
 build/
@@ -21,24 +45,18 @@ wheels/
 .installed.cfg
 *.egg
 
-# Data & PCAP files
-data/
-
-# Pytest / Coverage
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Environments
-.venv
+# ---------- Virtual environments ----------
+.venv/
 venv/
 ENV/
 
-# Output directory artifacts (keep directory structure if needed, ignore generated output runs)
-# output/*
+# ---------- Coverage ----------
+.coverage
+htmlcov/
 
-# IDEs
+# ---------- IDE / editor ----------
 .idea/
 .vscode/
 *.swp
 *.swo
+*~

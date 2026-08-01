@@ -64,6 +64,45 @@ class TestLoadPcapScapy:
         assert "188.190.10.10" in dst_ips
 
 
+# ===== IPv6 handling ========================================================
+
+class TestLoadPcapIPv6:
+    def test_native_ipv6_flow_loaded(self, tmp_path):
+        """A native IPv6/TCP flow must be loaded with its IPv6 destination —
+        not silently skipped as it was when the loader was IPv4-only."""
+        from scapy.all import Ether, IPv6, TCP, Raw, wrpcap
+        c2 = "2001:db8:dead:beef::1"
+        pkts = [
+            Ether() / IPv6(src="2001:db8::5", dst=c2) /
+            TCP(sport=50000, dport=443, flags="S"),
+            Ether() / IPv6(src="2001:db8::5", dst=c2) /
+            TCP(sport=50000, dport=443, flags="PA") / Raw(load=b"X" * 500),
+        ]
+        pcap = str(tmp_path / "v6.pcap")
+        wrpcap(pcap, pkts)
+        conns = load_pcap(pcap)
+        dst_ips = {c.dst_ip for c in conns}
+        assert c2 in dst_ips
+
+    def test_6to4_tunnel_resolves_inner_ipv6(self, tmp_path):
+        """6to4-tunnelled IPv6 (IPv4 proto-41 wrapping IPv6) must resolve to the
+        inner IPv6 endpoint, not the IPv4 tunnel relay — else tunnelled exfil
+        hides behind the relay address."""
+        from scapy.all import Ether, IP, IPv6, TCP, Raw, wrpcap
+        inner = "2001:638:902:1::7596"
+        pkts = [
+            Ether() / IP(src="81.131.67.131", dst="192.88.99.1") /
+            IPv6(src="2002:5183:4383::1", dst=inner) /
+            TCP(sport=1032, dport=21, flags="PA") / Raw(load=b"USER anonymous\r\n"),
+        ]
+        pcap = str(tmp_path / "6to4.pcap")
+        wrpcap(pcap, pkts)
+        conns = load_pcap(pcap)
+        dst_ips = {c.dst_ip for c in conns}
+        assert inner in dst_ips
+        assert "192.88.99.1" not in dst_ips   # tunnel relay must not be the endpoint
+
+
 # ===== Zeek conn.log path ===================================================
 
 SAMPLE_CONNLOG = """\

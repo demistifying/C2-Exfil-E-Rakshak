@@ -101,27 +101,30 @@ def _reputation_lookup(ip: str, path: str = _REP_DB) -> tuple[bool, str | None, 
     return False, None, None
 
 
-def attribute(ip: str, ja3_hash: str | None = None) -> Attribution:
-    """Attribute a destination by IP and, when available, JA3 fingerprint.
+def attribute(ip: str, ja3_hash: str | None = None,
+              ja4: str | None = None) -> Attribution:
+    """Attribute a destination by IP and, when available, TLS fingerprint.
 
-    The JA3 lookup is the encrypted-traffic path: a TLS-only C2 whose IP is
-    not yet known-bad can still be flagged if its ClientHello fingerprint
-    matches a known-bad JA3 (Cobalt Strike, Metasploit, etc.) seeded via
-    `feed_import.py ja3`. Either indicator producing a hit is sufficient —
-    an IP hit takes precedence for the source/note, otherwise the JA3 hit
-    supplies them.
+    The fingerprint lookup is the encrypted-traffic path: a TLS-only C2 whose IP
+    is not yet known-bad can still be flagged if its ClientHello fingerprint
+    matches a known-bad JA3 or JA4 (Cobalt Strike, Metasploit, stealer families)
+    seeded via feeds. Any one indicator producing a hit is sufficient; an IP hit
+    takes precedence for the source/note. JA4 is the modern, randomisation-robust
+    fingerprint (JA3 is kept for back-compat).
     """
     # Resolve the DB path at call time so an overridden THREATINTEL_DB (env or
     # test monkeypatch set after import) is honoured, not the import-time value.
     db_path = os.environ.get("THREATINTEL_DB", _REP_DB)
     country, asn, asn_org = _geo_lookup(ip)
     hit, source, note = _reputation_lookup(ip, path=db_path)
-    if not hit and ja3_hash:
-        ja3_hit, ja3_source, ja3_note = _reputation_lookup(ja3_hash, path=db_path)
-        if ja3_hit:
+    for label, fp in (("JA3", ja3_hash), ("JA4", ja4)):
+        if hit or not fp:
+            continue
+        fp_hit, fp_source, fp_note = _reputation_lookup(fp, path=db_path)
+        if fp_hit:
             hit = True
-            source = ja3_source or "known_bad_ja3"
-            note = f"JA3 match: {ja3_note}" if ja3_note else "known-bad JA3 fingerprint"
+            source = fp_source or f"known_bad_{label.lower()}"
+            note = f"{label} match: {fp_note}" if fp_note else f"known-bad {label} fingerprint"
     return Attribution(
         ip=ip, geo_country=country, asn=asn, asn_org=asn_org,
         reputation_hit=hit, reputation_source=source, reputation_note=note)

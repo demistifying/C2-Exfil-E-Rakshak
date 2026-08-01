@@ -16,11 +16,11 @@ from traffic_analysis import Connection
 
 
 def load_pcap(path: str) -> list[Connection]:
-    from scapy.all import rdpcap, IP, TCP, Raw
+    from scapy.all import rdpcap, IP, IPv6, TCP, Raw
     import ipaddress
     packets = rdpcap(path)
 
-    # Helper to check if IP is internal (RFC1918, loopback, link-local)
+    # Helper to check if IP is internal (RFC1918/IPv6 loopback/link-local/ULA)
     _INTERNAL_NETS = [
         ipaddress.ip_network("10.0.0.0/8"),
         ipaddress.ip_network("172.16.0.0/12"),
@@ -28,6 +28,9 @@ def load_pcap(path: str) -> list[Connection]:
         ipaddress.ip_network("127.0.0.0/8"),
         ipaddress.ip_network("169.254.0.0/16"),
         ipaddress.ip_network("0.0.0.0/8"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fe80::/10"),
+        ipaddress.ip_network("fc00::/7"),
     ]
 
     def is_internal(ip: str) -> bool:
@@ -48,9 +51,16 @@ def load_pcap(path: str) -> list[Connection]:
                  "http_uri": None, "ftp_upload_cmd": None})
 
     for pkt in packets:
-        if IP not in pkt or TCP not in pkt:
+        if TCP not in pkt:
             continue
-        ip, tcp = pkt[IP], pkt[TCP]
+        # Accept both IPv4 and IPv6 — both layers expose .src/.dst as strings.
+        # Prefer IPv6 when present so tunnelled IPv6 (6to4/Teredo, proto 41)
+        # resolves to the REAL inner endpoint, not the IPv4 tunnel relay —
+        # tunnelling IPv6 over IPv4 is a known way to evade v4-only monitoring.
+        ip = pkt.getlayer(IPv6) or pkt.getlayer(IP)
+        if ip is None:
+            continue
+        tcp = pkt[TCP]
 
         # Bidirectional identifier (sorted IPs and ports)
         canonical_key = tuple(sorted([(ip.src, int(tcp.sport)), (ip.dst, int(tcp.dport))]))

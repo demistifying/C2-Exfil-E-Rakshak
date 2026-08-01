@@ -1,2 +1,0 @@
-destination_ip,destination_port,confidence_tier,confidence_score,reputation_score,mitre_technique_id,data_type_accessed,timestamp,evidence_hash
-162.241.123.75,21,weak,0.8,0.0,T1041,,2026-02-03T16:14:01.435956+00:00,51f52f485a464d9fc4f6ff1aadc3d5eb7cbdac4a5813350764c610c51f5c81dd

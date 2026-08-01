@@ -98,6 +98,46 @@ python pipeline/orchestrator.py <pcap> <access_events.json>
 
 ## Reference Implementation
 
-The fixture file `data/access_events_fixture.json` is the reference
-implementation of this contract. If your ETW output matches this schema,
-it will work as a drop-in replacement.
+The fixture file `data/access_events_fixture.json` is a reference *sample*.
+The executable reference is **`pipeline/etw_ingest.py`** — it defines the
+schema (`ETWAccessEvent`), the valid `data_type` enum, and the
+`data_type → ATT&CK technique` mapping. If prose and code ever disagree,
+the code wins, because the code is what runs.
+
+---
+
+## Validating your output (sandbox team: run this)
+
+Point the ingestion validator at your ETW JSON. It checks every field,
+rejects malformed events with a specific reason, and — if you also pass the
+network events — checks that your clock lines up with the PCAP timeline:
+
+```bash
+python pipeline/etw_ingest.py your_access_events.json output/network_events.json
+```
+
+Your output is integration-ready when the validator reports **0 errors** and
+the clock-sync verdict is not flagged. Example of a clean run:
+
+```
+[etw_ingest] your_access_events.json
+  3 valid event(s), 0 error(s), 0 warning(s)
+  parsed events:
+    2026-02-03T16:13:59+00:00  browser_credentials   T1555.003  CryptUnprotectData [stealer.exe]
+  clock sync:
+    correlatable  : True  (closest forward Δ = 3.2s)
+    verdict       : clocks appear aligned
+```
+
+Common rejections and what they mean:
+
+| Message | Fix |
+|---|---|
+| `missing required field 'api_call'` | Every event needs `timestamp`, `data_type`, `api_call`. |
+| `invalid data_type 'X'` | Use one of the enum values in the table above. |
+| `timestamp '…' has no timezone` | Emit UTC with an offset (`+00:00`), not naive local time. |
+| `CLOCK SKEW …` | Your host clock and the PCAP capture clock disagree by more than the 15 s window — sync them. |
+
+Ingestion is non-strict by default: one malformed event is skipped and
+reported, not fatal, so a single bad row can't drop the whole handoff. Pass
+`strict=True` to `ingest()`/`load_etw_events()` if you want fail-fast in CI.

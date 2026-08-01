@@ -27,12 +27,18 @@ import json
 # Python marks documentation / TEST-NET ranges as private too, and those can
 # legitimately appear in ground-truth test data or unusual real captures.
 _INTERNAL_NETS = [
+    # IPv4
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("0.0.0.0/8"),
+    # IPv6 — loopback, link-local, and unique-local (RFC 4193). Global unicast
+    # (2000::/3) is treated as public, exactly like an IPv4 routable address.
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fc00::/7"),
 ]
 
 
@@ -72,6 +78,7 @@ class BeaconVerdict:
     jitter_ratio: float          # stddev / mean — low = regular = beacon-like
     is_beacon: bool
     confidence: float
+    size_cv: float = 0.0         # coeff. of variation of request sizes (low = regular)
 
 
 @dataclass
@@ -91,39 +98,54 @@ class ExfilVerdict:
 
 def detect_beaconing(conns: list[Connection],
                      min_count: int = 4,
-                     max_jitter_ratio: float = 0.25) -> list[BeaconVerdict]:
+                     max_jitter_ratio: float = 0.25,
+                     min_interval_s: float = 1.0) -> list[BeaconVerdict]:
     """
     Groups connections by destination and flags those with regular timing.
     A low jitter ratio (stddev of inter-arrival times / mean) is the classic
     signature of automated C2 check-ins, independent of payload content —
     so this works on encrypted traffic too.
+
+    `min_interval_s` rejects the degenerate case of several near-simultaneous
+    connections (mean interval ~0), which are parallel-connection bursts (e.g.
+    a browser opening 4 sockets to a CDN), not periodic C2 check-ins. Without
+    this guard those score a tiny jitter and masquerade as perfect beacons —
+    a real false-positive source on live traffic.
     """
-    by_dst: dict[tuple[str, int], list[float]] = defaultdict(list)
+    by_dst: dict[tuple[str, int], list[tuple[float, int]]] = defaultdict(list)
     for c in conns:
         if _is_private_ip(c.dst_ip):
             continue
-        by_dst[(c.dst_ip, c.dst_port)].append(c.ts)
+        by_dst[(c.dst_ip, c.dst_port)].append((c.ts, c.orig_bytes))
 
     verdicts: list[BeaconVerdict] = []
-    for (dst_ip, dst_port), times in by_dst.items():
-        if len(times) < min_count:
+    for (dst_ip, dst_port), rows in by_dst.items():
+        if len(rows) < min_count:
             continue
-        times.sort()
+        rows.sort()
+        times = [t for t, _ in rows]
+        sizes = [s for _, s in rows]
         intervals = [t2 - t1 for t1, t2 in zip(times, times[1:])]
         mean_iv = statistics.mean(intervals)
         stddev_iv = statistics.pstdev(intervals) if len(intervals) > 1 else 0.0
         jitter = (stddev_iv / mean_iv) if mean_iv > 0 else 1.0
-        is_beacon = jitter <= max_jitter_ratio
-        # Confidence: tighter timing + more callbacks => higher confidence.
+        # Payload-size regularity: real C2 beacons send similarly-sized check-ins.
+        mean_sz = statistics.mean(sizes) if sizes else 0.0
+        size_cv = (statistics.pstdev(sizes) / mean_sz) if mean_sz > 0 else 0.0
+        is_beacon = (jitter <= max_jitter_ratio) and (mean_iv >= min_interval_s)
+        # Confidence: tighter timing + more callbacks => higher; regular sizes
+        # add a small corroboration boost.
         conf = 0.0
         if is_beacon:
-            conf = min(1.0, (1 - jitter / max_jitter_ratio) * 0.6
-                            + min(len(times) / 10, 1.0) * 0.4)
+            conf = ((1 - jitter / max_jitter_ratio) * 0.55
+                    + min(len(times) / 10, 1.0) * 0.35
+                    + (0.10 if size_cv < 0.1 else 0.0))
+            conf = min(1.0, conf)
         verdicts.append(BeaconVerdict(
             dst_ip=dst_ip, dst_port=dst_port, connection_count=len(times),
             mean_interval_s=round(mean_iv, 2), interval_stddev_s=round(stddev_iv, 3),
             jitter_ratio=round(jitter, 3), is_beacon=is_beacon,
-            confidence=round(conf, 2),
+            confidence=round(conf, 2), size_cv=round(size_cv, 3),
         ))
     return verdicts
 
@@ -168,6 +190,73 @@ def detect_exfil(conns: list[Connection],
                 http_method=c.http_method, http_uri=c.http_uri,
                 is_exfil=True, confidence=round(conf, 2),
             ))
+    return verdicts
+
+
+# ----- Confidence tiering --------------------------------------------------
+
+def network_confidence_tier(reputation_hit: bool,
+                            corroborating_signals: int) -> str:
+    """Grade a network destination on the 4-tier scale shared with the
+    correlation stage and the Android module.
+
+    The core principle: a behavioural signal alone (a big upload, a STOR, a
+    beacon) is a CANDIDATE, not a verdict — benign uploads and CDN bursts look
+    identical to exfil at the network layer. Only independent corroboration
+    promotes it.
+
+      confirmed : threat-intel / known-bad JA3 reputation hit (independent)
+      strong    : >= 2 independent behavioural signals on the same destination
+                  (e.g. it both beacons AND exfils)
+      weak      : a single behavioural signal, no intel backing (suspected)
+
+    Host<->network correlation, when available, produces its own (higher)
+    tiers in correlation.py; this covers network-only destinations.
+    """
+    if reputation_hit:
+        return "confirmed"
+    if corroborating_signals >= 2:
+        return "strong"
+    return "weak"
+
+
+# ----- Catch-all: unclassified egress --------------------------------------
+
+@dataclass
+class EgressVerdict:
+    dst_ip: str
+    dst_port: int
+    orig_bytes: int
+    upload_ratio: float
+
+
+def detect_unclassified_egress(conns: list[Connection], covered_dsts: set,
+                               min_bytes: int = 2048,
+                               min_ratio: float = 0.6) -> list[EgressVerdict]:
+    """Content-agnostic net for UNKNOWN exfil channels.
+
+    A signature/heuristic can only catch techniques it has a rule for. This is
+    the safety net for the ones it doesn't: a flow to an external host that
+    pushes data OUT (high upload ratio) and is NOT already explained by a
+    specific detector. It doesn't care what protocol or encoding is used — only
+    that "data is leaving to somewhere we haven't accounted for." In a sandbox
+    detonation, unexplained egress is inherently suspect, so this is surfaced as
+    a low-confidence (weak) candidate for the analyst rather than dropped.
+    """
+    verdicts: list[EgressVerdict] = []
+    seen: set = set()
+    for c in conns:
+        if _is_private_ip(c.dst_ip) or c.dst_ip in covered_dsts:
+            continue
+        total = c.orig_bytes + c.resp_bytes
+        ratio = (c.orig_bytes / total) if total > 0 else 0.0
+        if c.orig_bytes >= min_bytes and ratio >= min_ratio:
+            key = (c.dst_ip, c.dst_port)
+            if key in seen:
+                continue
+            seen.add(key)
+            verdicts.append(EgressVerdict(c.dst_ip, c.dst_port, c.orig_bytes,
+                                          round(ratio, 2)))
     return verdicts
 
 

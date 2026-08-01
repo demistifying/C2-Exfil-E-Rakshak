@@ -12,8 +12,40 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
 
 from pipeline.traffic_analysis import (
     Connection, detect_beaconing, detect_exfil, detect_ftp_exfil, _is_private_ip,
+    network_confidence_tier, detect_unclassified_egress,
 )
 from conftest import _make_conn
+
+
+class TestUnclassifiedEgress:
+    """Content-agnostic catch-all for UNKNOWN exfil channels."""
+
+    def test_novel_channel_flagged(self):
+        """Raw high-upload flow on an odd port, unexplained → flagged."""
+        c = _make_conn(dst_ip="203.0.113.9", dst_port=4444,
+                       orig_bytes=50000, resp_bytes=500)
+        v = detect_unclassified_egress([c], covered_dsts=set())
+        assert len(v) == 1 and v[0].dst_ip == "203.0.113.9"
+
+    def test_already_explained_not_reflagged(self):
+        c = _make_conn(dst_ip="203.0.113.9", dst_port=4444,
+                       orig_bytes=50000, resp_bytes=500)
+        assert detect_unclassified_egress([c], covered_dsts={"203.0.113.9"}) == []
+
+    def test_download_not_flagged(self):
+        c = _make_conn(dst_ip="203.0.113.9", dst_port=443,
+                       orig_bytes=200, resp_bytes=90000)
+        assert detect_unclassified_egress([c], covered_dsts=set()) == []
+
+    def test_private_dst_not_flagged(self):
+        c = _make_conn(dst_ip="192.168.1.5", dst_port=4444,
+                       orig_bytes=50000, resp_bytes=0)
+        assert detect_unclassified_egress([c], covered_dsts=set()) == []
+
+    def test_tiny_upload_not_flagged(self):
+        c = _make_conn(dst_ip="203.0.113.9", dst_port=4444,
+                       orig_bytes=100, resp_bytes=0)
+        assert detect_unclassified_egress([c], covered_dsts=set()) == []
 
 
 def _ftp_conn(dst_ip="203.0.113.80", dst_port=21, orig_bytes=200,
@@ -76,6 +108,47 @@ class TestBeaconingPrivateIP:
         ]
         verdicts = detect_beaconing(conns)
         assert len(verdicts) == 0
+
+
+class TestBeaconingNearZeroInterval:
+    def test_parallel_connections_not_a_beacon(self):
+        """4 near-simultaneous connections (mean interval ~0) are a parallel
+        burst (browser opening sockets to a CDN), NOT a periodic beacon —
+        this was a real false-positive source on live enterprise traffic."""
+        conns = [
+            _make_conn(ts=1000.0 + i * 0.01, dst_ip="203.0.113.50", dst_port=443)
+            for i in range(6)
+        ]
+        beacons = [v for v in detect_beaconing(conns) if v.is_beacon]
+        assert len(beacons) == 0
+
+    def test_real_interval_still_beacons(self):
+        """Sanity: genuine 30s-spaced callbacks still flag."""
+        conns = [
+            _make_conn(ts=1000.0 + i * 30.0, dst_ip="203.0.113.51", dst_port=443)
+            for i in range(6)
+        ]
+        beacons = [v for v in detect_beaconing(conns) if v.is_beacon]
+        assert len(beacons) == 1
+
+
+# ===== Confidence tiering ==================================================
+
+class TestConfidenceTier:
+    def test_reputation_is_confirmed(self):
+        """Threat-intel / JA3 backing → confirmed, even on a single signal."""
+        assert network_confidence_tier(True, 1) == "confirmed"
+
+    def test_two_signals_is_strong(self):
+        """Beacon AND exfil on the same dst, no intel → strong."""
+        assert network_confidence_tier(False, 2) == "strong"
+
+    def test_single_signal_is_weak(self):
+        """A lone behavioural signal (STOR/exfil/beacon), no intel → weak."""
+        assert network_confidence_tier(False, 1) == "weak"
+
+    def test_reputation_beats_signal_count(self):
+        assert network_confidence_tier(True, 2) == "confirmed"
 
 
 # ===== Exfiltration detection ==============================================
@@ -185,6 +258,19 @@ class TestIsPrivateIP:
 
     def test_public_ip(self):
         assert _is_private_ip("188.190.10.10") is False
+
+    def test_ipv6_loopback(self):
+        assert _is_private_ip("::1") is True
+
+    def test_ipv6_link_local(self):
+        assert _is_private_ip("fe80::1") is True
+
+    def test_ipv6_unique_local(self):
+        assert _is_private_ip("fc00::1") is True
+
+    def test_ipv6_global_unicast_is_public(self):
+        """A routable IPv6 (e.g. an FTP/C2 server) must NOT be filtered."""
+        assert _is_private_ip("2001:638:902:1:201:2ff:fee2:7596") is False
 
     def test_invalid_ip(self):
         assert _is_private_ip("not-an-ip") is False

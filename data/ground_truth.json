@@ -1,0 +1,103 @@
+{
+  "sample_infostealer.pcap": {
+    "malicious_ips": ["188.190.10.10"],
+    "notes": "Synthetic capture mirroring Redline Stealer structure"
+  },
+  "2024-10-23-Redline-Stealer-infection-traffic.pcap/2024-10-23-Redline-Stealer-infection-traffic.pcap": {
+    "malicious_ips": ["188.190.10.10"],
+    "benign_ips_note": "104.26.13.31 (api.ip.sb) is used for IP lookup — reconnaissance, not C2. Flagging it is acceptable but not required.",
+    "c2_port": 55123,
+    "family": "Redline Stealer",
+    "source": "malware-traffic-analysis.net, 2024-10-23"
+  },
+  "2026-01-31-traffic-analysis-exercise.pcap/2026-01-31-traffic-analysis-exercise.pcap": {
+    "malicious_ips": ["153.92.1.49"],
+    "c2_port": 80,
+    "family": "Lumma Stealer",
+    "source": "malware-traffic-analysis.net, 2026-01-31"
+  },
+  "2024-09-17-Snake-KeyLogger-infection-FTP-exfil.pcap/2024-09-17-Snake-KeyLogger-infection-FTP-exfil.pcap": {
+    "malicious_ips": ["216.252.233.118"],
+    "c2_port": 21,
+    "family": "Snake KeyLogger",
+    "exfil_channel": "FTP (Pure-FTPd), PASV data channel; ~516 KB uploaded",
+    "source": "malware-traffic-analysis.net, 2024-09-17"
+  },
+  "2026-02-03-GuLoader-for-AgentTesla-style-infection-with-FTP-data-exfil.pcap/2026-02-03-GuLoader-for-AgentTesla-style-infection-with-FTP-data-exfil.pcap": {
+    "malicious_ips": ["162.241.123.75"],
+    "malicious_domains": ["drive.google.com"],
+    "c2_port": 21,
+    "family": "GuLoader / AgentTesla-style",
+    "exfil_channel": "FTP (ftp.corwineagles.com) + GuLoader payload staged from Google Drive (documented IOC, dual-use → weak tier)",
+    "source": "malware-traffic-analysis.net, 2026-02-03"
+  },
+  "FTPv6-1.pcap": {
+    "malicious_ips": [],
+    "benign": true,
+    "notes": "Benign anonymous FTP over IPv6 (download). Wireshark SampleCaptures, converted from NetMon. Expected: 0 flags.",
+    "caveat": "FTP session is IPv6; loader is IPv4-only so the FTP flow is not evaluated."
+  },
+  "FTPv6-2.pcap": {
+    "malicious_ips": [],
+    "benign": true,
+    "notes": "Benign FTP over IPv6 (RETR download of zebra tarball). Wireshark SampleCaptures, converted from NetMon. Expected: 0 flags.",
+    "caveat": "FTP session is IPv6 (6to4-tunnelled); inner endpoint now resolved."
+  },
+  "ftp.pcap": {
+    "malicious_ips": [],
+    "benign": true,
+    "notes": "Benign LAN FTP session (RETR Music.mp3 download). Expected: 0 flags.",
+    "caveat": "RETR (download), and both FTP endpoints are RFC1918 private; does NOT exercise the STOR-to-public-server false-positive path."
+  },
+  "FTP Testing/ipv6.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Zeek FTP test trace — native IPv6 FTP (RETR). Regression check: IPv6 processed, 0 flags."
+  },
+  "FTP Testing/ftp-auth-tls.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Zeek FTP test trace — FTPS (AUTH TLS). Regression check: encrypted control channel fingerprinted (JA3), benign client so 0 flags."
+  },
+  "FTP Testing/ftp-invalid-reply-code.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Zeek FTP test trace — malformed reply codes. Regression check: parser robustness, no crash, 0 flags."
+  },
+  "FTP Testing/bigtransfer.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Zeek FTP test trace — large RETR download. Regression check: download precision, 0 flags."
+  },
+  "FTP Testing/retr.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Zeek FTP test trace — RETR download. Regression check: download precision, 0 flags."
+  },
+  "dnscat2_dns_tunneling_1hr.pcap": {
+    "malicious_ips": [],
+    "malicious_domains": ["cisco-update.com"],
+    "family": "dnscat2 (DNS tunnelling C2)",
+    "channel": "DNS tunnel — TXT/MX/CNAME, high-entropy long subdomains",
+    "source": "Active Countermeasures Malware-of-the-Day"
+  },
+  "dns-exfiltration-dataset/dns-exfiltration-dataset/01_original_pcap_files/benign/top_1_million_domains/normal_00000_20230805150331.pcap": {
+    "malicious_ips": [], "benign": true,
+    "notes": "Benign DNS (top-1M domains). Regression check: high query volume/uniqueness but low entropy/short subdomains → 0 flags."
+  },
+  "2025-01-31-VIP-Recovery-data-exfil-over-SMTP.pcap/2025-01-31-VIP-Recovery-data-exfil-over-SMTP.pcap": {
+    "malicious_ips": ["208.91.198.143"],
+    "malicious_domains": ["api.telegram.org"],
+    "family": "VIP Recovery stealer",
+    "channel": "SMTP self-send exfil (director@igakuin.com) + Telegram Bot API",
+    "source": "malware-traffic-analysis.net, 2025-01-31"
+  },
+  "2025-01-31-AgentTesla-style-data-exifil-over-FTP.pcap/2025-01-31-AgentTesla-style-data-exifil-over-FTP.pcap": {
+    "malicious_ips": ["93.89.225.40"],
+    "family": "AgentTesla-style",
+    "channel": "FTP STOR (PW_<host>.html), low-volume",
+    "source": "malware-traffic-analysis.net, 2025-01-31"
+  },
+  "2019-07-25-Hancitor-style-Amadey-with-Pony-and-Cobalt-Strike.pcap/2019-07-25-Hancitor-style-Amadey-with-Pony-and-Cobalt-Strike.pcap": {
+    "malicious_ips": ["31.44.184.33"],
+    "malicious_domains": ["codeotso.com"],
+    "family": "Hancitor/Amadey/Pony + Cobalt Strike",
+    "channel": "HTTP C2 gate (/submit.php) + ~57s beacon",
+    "source": "malware-traffic-analysis.net, 2019-07-25"
+  }
+}
