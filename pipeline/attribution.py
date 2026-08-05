@@ -130,6 +130,29 @@ def attribute(ip: str, ja3_hash: str | None = None,
         reputation_hit=hit, reputation_source=source, reputation_note=note)
 
 
+def _registered_domain(domain: str) -> str:
+    labels = domain.lower().rstrip(".").split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else domain.lower()
+
+
+def domain_reputation(domain: str, path: str | None = None):
+    """Reputation lookup for a DOMAIN indicator (from URLhaus/DGA feeds etc.).
+
+    Checks the exact host and its registered domain, so a known-bad
+    `evil.example` still matches an observed `sub.evil.example`. This is the path
+    that promotes a DNS-tunnel / cloud / HTTP-gate finding — whose IOC is a
+    domain, not an IP — to the confirmed tier once feeds are loaded.
+    """
+    if not domain:
+        return False, None, None
+    db = path or os.environ.get("THREATINTEL_DB", _REP_DB)
+    for cand in (domain.lower().rstrip("."), _registered_domain(domain)):
+        hit, source, note = _reputation_lookup(cand, path=db)
+        if hit:
+            return hit, source, note
+    return False, None, None
+
+
 if __name__ == "__main__":
     import sys
     init_threatintel_db()

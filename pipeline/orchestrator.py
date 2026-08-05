@@ -287,18 +287,36 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # specific detector above. Content-agnostic; surfaced weak so novel exfil
     # never leaves silently, without asserting more than we know.
     covered = {e["dst_ip"] for e in events}
+    sni_by_ip = {t.dst_ip: t.server_name for t in bundle.tls if t.server_name}
     for g in detect_unclassified_egress(conns, covered):
         rep = bool(attribute(g.dst_ip).reputation_hit)
         events.append({
             "kind": "unclassified_egress", "dst_ip": g.dst_ip,
             "dst_port": g.dst_port, "timestamp": dns_ts, "confidence": 0.4,
             "reputation_hit": rep, "geo_country": None, "asn": None,
-            "asn_org": None, "destination_domain": None, "ja3_hash": None,
+            "asn_org": None,
+            # attach SNI when known so a sanctioned-service allowlist can match it
+            "destination_domain": sni_by_ip.get(g.dst_ip), "ja3_hash": None,
             "plaintext_available": False,
             "confidence_tier": "confirmed" if rep else "weak",
             "egress_detail": f"{g.orig_bytes}B out, upload-ratio {g.upload_ratio} "
                              f"(unexplained by specific detectors)",
         })
+
+    # --- domain reputation (threat-intel feeds) ---
+    # A finding whose destination DOMAIN is on a known-bad feed (URLhaus, DGA
+    # lists, MISP) is independently corroborated -> confirmed. This is what
+    # promotes DNS-tunnel / cloud / HTTP-gate findings (domain IOCs) once feeds
+    # are loaded, and is the main lever on confirmed-tier recall.
+    from attribution import domain_reputation
+    for e in events:
+        dom = e.get("destination_domain")
+        if dom and not e.get("reputation_hit"):
+            hit, source, note = domain_reputation(dom)
+            if hit:
+                e["reputation_hit"] = True
+                e["confidence_tier"] = "confirmed"
+                e["reputation_note"] = f"domain intel: {note or source}"
 
     # --- confidence tiering ---
     # Count distinct behavioural signal TYPES per destination so a dst that
@@ -350,6 +368,13 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                     "confidence_tier": "strong",
                     "static_note": f"C2 in binary{fam}, not observed on network (dormant)",
                 })
+
+    # --- sanctioned-service allowlist ---
+    # Down-tier WEAK findings to known-good endpoints (update/telemetry/OCSP) to
+    # 'allowlisted' so they don't clutter review. Never touches confirmed/strong;
+    # nothing is hidden, only annotated. (F2)
+    from allowlist import apply_allowlist
+    apply_allowlist(events)
     return events
 
 
@@ -498,6 +523,20 @@ def main():
         print(f"    STIX: {n_stix} indicators -> output/iocs_stix.json")
     except Exception as e:
         print(f"    [warn] IOC export failed: {e}")
+
+    # Stage 5b: family / campaign attribution
+    from family_attribution import attribute_family, verdicts_to_dicts
+    static_family = None
+    if static_prior_path and os.path.exists(static_prior_path):
+        from static_prior import load_static_prior
+        static_family = load_static_prior(static_prior_path).prior.family
+    fam = attribute_family(net, static_family=static_family)
+    with open("output/attribution.json", "w") as f:
+        json.dump(verdicts_to_dicts(fam), f, indent=2)
+    if fam:
+        print("\n[*] Stage 5b: family / campaign attribution")
+        for v in fam:
+            print(f"    {v.confidence.upper():9} {v.family} (via {v.basis}) — {v.evidence[0]}")
 
     # Stage 6: reconstruct exfiltrated content (D1) + item-level provenance
     from content_recon import reconstruct_outbound_content

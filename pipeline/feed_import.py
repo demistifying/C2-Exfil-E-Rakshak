@@ -168,30 +168,116 @@ def import_ja3_known_bad(db_path: str = _REP_DB) -> int:
     return count
 
 
+def import_ja4_known_bad(db_path: str = _REP_DB) -> int:
+    """Seed known-bad JA4 fingerprints into the DB (modern JA3 successor).
+    Extend `tls_analysis.KNOWN_BAD_JA4` or feed a JA4 blocklist via
+    import_indicator_list(path, kind='ja4')."""
+    from tls_analysis import KNOWN_BAD_JA4
+    conn = sqlite3.connect(db_path)
+    _ensure_schema(conn)
+    n = 0
+    for ja4, desc in KNOWN_BAD_JA4.items():
+        conn.execute("INSERT OR REPLACE INTO bad_indicators "
+                     "(value, source, note, indicator_type) VALUES (?,?,?,?)",
+                     (ja4, "known_bad_ja4", desc, "ja4"))
+        n += 1
+    conn.commit(); conn.close()
+    return n
+
+
+def import_indicator_list(path: str, kind: str = "domain",
+                          source: str = "custom", db_path: str = _REP_DB) -> int:
+    """Import a plain one-indicator-per-line list (e.g. a DGA domain feed or a
+    JA4 blocklist). '#' comment lines are ignored."""
+    if not os.path.exists(path):
+        print(f"[!] File not found: {path}")
+        return 0
+    conn = sqlite3.connect(db_path)
+    _ensure_schema(conn)
+    n = 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            v = line.strip()
+            if not v or v.startswith("#"):
+                continue
+            v = v.split(",")[0].strip().strip('"').lower()
+            if not v:
+                continue
+            conn.execute("INSERT OR REPLACE INTO bad_indicators "
+                         "(value, source, note, indicator_type) VALUES (?,?,?,?)",
+                         (v, source, f"{kind} blocklist", kind))
+            n += 1
+    conn.commit(); conn.close()
+    return n
+
+
+def db_stats(db_path: str = _REP_DB) -> dict:
+    """Counts per indicator type — for the report / freshness check."""
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    _ensure_schema(conn)
+    rows = conn.execute("SELECT indicator_type, COUNT(*) FROM bad_indicators "
+                        "GROUP BY indicator_type").fetchall()
+    conn.close()
+    return {t or "ip": c for t, c in rows}
+
+
+def refresh(directory: str, db_path: str = _REP_DB) -> dict:
+    """Offline bulk refresh: import every recognised feed file in a directory.
+
+    Filename conventions: feodo*.csv, urlhaus*.csv, *dga*.txt / *domains*.txt,
+    *ja4*.txt. Download the feeds once on a connected machine, drop them here,
+    and run this air-gapped. (MISP path: swap this for a pymisp pull into the
+    same table.)
+    """
+    import glob
+    total = {}
+    for p in sorted(glob.glob(os.path.join(directory, "*"))):
+        name = os.path.basename(p).lower()
+        if name.startswith("feodo"):
+            total[name] = import_feodo(p, db_path)
+        elif name.startswith("urlhaus"):
+            total[name] = import_urlhaus(p, db_path)
+        elif "dga" in name or "domains" in name or "domain" in name:
+            total[name] = import_indicator_list(p, "domain", "feed/dga", db_path)
+        elif "ja4" in name:
+            total[name] = import_indicator_list(p, "ja4", "feed/ja4", db_path)
+        elif "ja3" in name:
+            total[name] = import_indicator_list(p, "ja3", "feed/ja3", db_path)
+    return total
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python pipeline/feed_import.py feodo <csv_path>")
-        print("  python pipeline/feed_import.py urlhaus <csv_path>")
-        print("  python pipeline/feed_import.py ja3")
+        print("  python pipeline/feed_import.py feodo <csv>")
+        print("  python pipeline/feed_import.py urlhaus <csv>")
+        print("  python pipeline/feed_import.py domains <list.txt>")
+        print("  python pipeline/feed_import.py ja3 | ja4")
+        print("  python pipeline/feed_import.py refresh <feed_dir>")
+        print("  python pipeline/feed_import.py stats")
         sys.exit(1)
 
     feed_type = sys.argv[1].lower()
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
 
     if feed_type == "feodo":
-        path = sys.argv[2] if len(sys.argv) > 2 else "data/feodotracker.csv"
-        n = import_feodo(path)
-        print(f"[*] Imported {n} Feodo Tracker C2 IPs")
-
+        print(f"[*] Imported {import_feodo(arg or 'data/feodotracker.csv')} Feodo C2 IPs")
     elif feed_type == "urlhaus":
-        path = sys.argv[2] if len(sys.argv) > 2 else "data/urlhaus.csv"
-        n = import_urlhaus(path)
-        print(f"[*] Imported {n} URLhaus indicators")
-
+        print(f"[*] Imported {import_urlhaus(arg or 'data/urlhaus.csv')} URLhaus indicators")
+    elif feed_type == "domains":
+        print(f"[*] Imported {import_indicator_list(arg, 'domain', 'custom')} domain indicators")
     elif feed_type == "ja3":
-        n = import_ja3_known_bad()
-        print(f"[*] Imported {n} known-bad JA3 hashes")
-
+        print(f"[*] Imported {import_ja3_known_bad()} known-bad JA3 hashes")
+    elif feed_type == "ja4":
+        print(f"[*] Imported {import_ja4_known_bad()} known-bad JA4 fingerprints")
+    elif feed_type == "refresh":
+        res = refresh(arg or "data/feeds")
+        print(f"[*] Refresh imported: {res}")
+        print(f"[*] DB now holds: {db_stats()}")
+    elif feed_type == "stats":
+        print(f"[*] Threat-intel DB: {db_stats()}")
     else:
         print(f"[!] Unknown feed type: {feed_type}")
         sys.exit(1)

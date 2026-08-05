@@ -37,7 +37,10 @@ attributed, evidence-graded C2/exfiltration findings in the shared schema.
 | Zeek-primary ingestion + unified data model | ✅ Working | **Yes** — conn/dns/http/ssl/ftp/smtp/files, scapy fallback |
 | Case manifest + chain of custody (reproducible case_id) | ✅ Working | **Yes** |
 | Static-IOC-prior correlation (binary C2 ↔ observed traffic → confirmed) | ✅ Working | **Yes** — promotes AgentTesla FTP C2 weak→confirmed |
-| Test suite (pytest, 206 tests) | ✅ Working | **Yes** |
+| Threat-intel at scale — domain reputation + feed import (Feodo/URLhaus/JA3/JA4/DGA) | ✅ Working | **Yes** — a known-bad domain promotes DNS/cloud/HTTP findings to confirmed |
+| Sanctioned-service allowlist (down-tier weak, never hide; confirmed wins) | ✅ Working | **Yes** — suppresses benign update/telemetry/OCSP egress noise |
+| Family / campaign attribution (static prior + intel + behaviour) | ✅ Working | **Yes** — Redline via intel, Cobalt Strike/dnscat2 via behaviour |
+| Test suite (pytest, 233 tests) | ✅ Working | **Yes** |
 
 *Correlation needs host access events from the Windows ST/DT sandbox (ETW).
 That is the one genuine cross-module dependency. Until it lands, correlation

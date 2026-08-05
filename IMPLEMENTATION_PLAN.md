@@ -202,14 +202,20 @@ dependencies. Build order is in §9.
 - **Depends on:** sandbox team ETW emission (external); interface already built.
 
 ### F. Threat intelligence & attribution
-- **F1 Feed integration at scale.** Offline feed bundles (Feodo, URLhaus, JA4/JA3
-  intel, DGA lists) with a documented refresh model; optional MISP pull when
-  connected.
-- **F2 Known-good baseline / allowlist.** Sanctioned-service allowlist to suppress
-  legitimate cloud endpoints (the CIC-IDS false-positive lesson) — but in forensic
-  mode, suppress to a lower tier rather than drop.
-- **F3 Family/campaign attribution.** Map extracted IOCs + fingerprints to known
-  families/campaigns.
+- **F1 Feed integration at scale.** ✅ `feed_import.py` (Feodo, URLhaus, JA3, JA4,
+  generic domain/DGA lists) + offline `refresh <dir>` + `stats`; **domain
+  reputation** (`attribution.domain_reputation`) wired so a known-bad domain
+  promotes DNS/cloud/HTTP findings to *confirmed*. MISP pull remains the connected
+  upgrade path (same table).
+- **F2 Known-good baseline / allowlist.** ✅ `allowlist.py` + `data/allowlist.json`
+  — narrow sanctioned-service list; down-tiers WEAK findings to `allowlisted`
+  (annotated, never hidden); confirmed/strong untouched (confirmed wins vs
+  domain-fronting); exfil-abused services (Drive/Telegram/Discord) pointedly
+  excluded.
+- **F3 Family/campaign attribution.** ✅ `family_attribution.py` — fuses static-
+  prior family (confirmed), threat-intel notes / known-bad fingerprints (likely),
+  and behavioural signatures (possible) into ranked, explainable verdicts. Emits
+  `output/attribution.json`. **Workstream F complete.**
 - **Acceptance:** confirmed-tier recall rises as feed coverage improves; allowlist
   demonstrably drops benign cloud flags a tier without hiding them.
 
