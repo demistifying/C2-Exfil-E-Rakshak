@@ -79,6 +79,8 @@ class BeaconVerdict:
     is_beacon: bool
     confidence: float
     size_cv: float = 0.0         # coeff. of variation of request sizes (low = regular)
+    handshake_ratio: float = 1.0  # fraction of callbacks that got a server reply
+    unanswered: bool = False      # True = retry storm to a dead host, not a real beacon
 
 
 @dataclass
@@ -111,20 +113,32 @@ def detect_beaconing(conns: list[Connection],
     a browser opening 4 sockets to a CDN), not periodic C2 check-ins. Without
     this guard those score a tiny jitter and masquerade as perfect beacons —
     a real false-positive source on live traffic.
+
+    Handshake guard: regular-interval SYNs to a host that never replies (a dead
+    C2, or a `simulated_inetsim` responder that doesn't speak the sample's
+    protocol) are textbook retry storms — perfectly periodic, zero response.
+    They look identical to a beacon on timing alone. We measure the fraction of
+    callbacks that actually got a server reply (`handshake_ratio`) from Zeek
+    conn history / responder bytes; a flow with no completed handshake is TAGGED
+    `unanswered` (not dropped — recall-first) so the orchestrator can cap it to a
+    weak candidate with a clear reason instead of asserting a beacon.
     """
-    by_dst: dict[tuple[str, int], list[tuple[float, int]]] = defaultdict(list)
+    by_dst: dict[tuple[str, int], list[tuple[float, int, bool]]] = defaultdict(list)
     for c in conns:
         if _is_private_ip(c.dst_ip):
             continue
-        by_dst[(c.dst_ip, c.dst_port)].append((c.ts, c.orig_bytes))
+        by_dst[(c.dst_ip, c.dst_port)].append(
+            (c.ts, c.orig_bytes, _responded(c)))
 
     verdicts: list[BeaconVerdict] = []
     for (dst_ip, dst_port), rows in by_dst.items():
         if len(rows) < min_count:
             continue
         rows.sort()
-        times = [t for t, _ in rows]
-        sizes = [s for _, s in rows]
+        times = [t for t, _, _ in rows]
+        sizes = [s for _, s, _ in rows]
+        answered = sum(1 for _, _, r in rows if r)
+        handshake_ratio = answered / len(rows)
         intervals = [t2 - t1 for t1, t2 in zip(times, times[1:])]
         mean_iv = statistics.mean(intervals)
         stddev_iv = statistics.pstdev(intervals) if len(intervals) > 1 else 0.0
@@ -133,21 +147,40 @@ def detect_beaconing(conns: list[Connection],
         mean_sz = statistics.mean(sizes) if sizes else 0.0
         size_cv = (statistics.pstdev(sizes) / mean_sz) if mean_sz > 0 else 0.0
         is_beacon = (jitter <= max_jitter_ratio) and (mean_iv >= min_interval_s)
+        # No callback ever got a reply -> retry storm to a dead host, not a beacon.
+        unanswered = is_beacon and answered == 0
         # Confidence: tighter timing + more callbacks => higher; regular sizes
-        # add a small corroboration boost.
+        # add a small corroboration boost; an unanswered storm is knocked right
+        # down (it isn't evidence of an established C2 channel).
         conf = 0.0
         if is_beacon:
             conf = ((1 - jitter / max_jitter_ratio) * 0.55
                     + min(len(times) / 10, 1.0) * 0.35
                     + (0.10 if size_cv < 0.1 else 0.0))
             conf = min(1.0, conf)
+            if unanswered:
+                conf = min(conf, 0.3)
         verdicts.append(BeaconVerdict(
             dst_ip=dst_ip, dst_port=dst_port, connection_count=len(times),
             mean_interval_s=round(mean_iv, 2), interval_stddev_s=round(stddev_iv, 3),
             jitter_ratio=round(jitter, 3), is_beacon=is_beacon,
             confidence=round(conf, 2), size_cv=round(size_cv, 3),
+            handshake_ratio=round(handshake_ratio, 2), unanswered=unanswered,
         ))
     return verdicts
+
+
+def _responded(c: Connection) -> bool:
+    """Did the server actually reply on this connection?
+
+    True if any bytes came back OR Zeek's history shows responder-side activity
+    (lowercase letters are responder events: 'h' SYN-ACK, 'a' ACK, 'd' data,
+    'f' FIN). A connection with only orig-side history (e.g. 'S', 'Sr') and zero
+    response bytes never completed a handshake.
+    """
+    if getattr(c, "resp_bytes", 0) > 0:
+        return True
+    return any(ch.islower() for ch in (getattr(c, "history", "") or ""))
 
 
 # ----- Exfiltration detection ----------------------------------------------

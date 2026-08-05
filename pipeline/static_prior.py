@@ -41,7 +41,10 @@ import ipaddress
 import json
 import os
 
-VALID_TYPES = frozenset({"ip", "domain", "url", "email"})
+# Matches the ST/DT c2_static_prior.schema.json ioc type enum. "hash" is a
+# sample/file indicator (not a network destination) — accepted so strict
+# ingestion of a real bundle doesn't reject it, but it's not network-correlatable.
+VALID_TYPES = frozenset({"ip", "domain", "url", "email", "hash"})
 
 
 @dataclass

@@ -24,9 +24,11 @@ import os
 import sys
 import platform
 
-SCHEMA_VERSION = "1.1"          # bump when the exfil_events schema changes
+SCHEMA_VERSION = "1.2"          # bump when the exfil_events schema changes
                                 # 1.1: +destination_domain, asn_org,
                                 #      reputation_note, reputation_source
+                                # 1.2: +session_id, cape_task_id (per-run join),
+                                #      manifest_sha256 (ST/DT custody-chain link)
 
 
 def sha256_file(path: str) -> str:

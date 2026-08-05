@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS static_iocs (
 CREATE TABLE IF NOT EXISTS exfil_events (
   event_id            TEXT PRIMARY KEY,        -- uuid
   sample_id           TEXT REFERENCES samples(sample_id),
+  session_id          TEXT,                    -- WinST/DT handoff session (per-run join)
+  cape_task_id        INTEGER,                 -- CAPE task id (per-run join)
   platform            TEXT NOT NULL,
   timestamp           TIMESTAMPTZ NOT NULL,
   data_type_accessed  TEXT,
@@ -38,7 +40,8 @@ CREATE TABLE IF NOT EXISTS exfil_events (
   confidence_score    REAL,
   confidence_tier     TEXT,
   mitre_technique_id  TEXT,
-  evidence_hash       TEXT                     -- sha256 chained to prior row
+  manifest_sha256     TEXT,                    -- ST/DT bundle hash (custody-chain link; first row)
+  evidence_hash       TEXT                     -- sha256 chained to prior row (seeded from manifest_sha256)
 );
 
 CREATE TABLE IF NOT EXISTS evidence_log (

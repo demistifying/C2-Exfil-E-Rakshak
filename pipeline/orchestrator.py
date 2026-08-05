@@ -56,15 +56,25 @@ MITRE = {  # capability -> ATT&CK technique
 
 
 def build_network_events(pcap_path: str, zeek_dir: str | None = None,
-                         static_prior_path: str | None = None) -> list[dict]:
+                         static_prior_path: str | None = None,
+                         handoff=None) -> list[dict]:
     """Stages 1-2: run detection + attribution.
 
     Zeek-primary: when a Zeek log directory with conn.log is supplied it is the
     authoritative source; otherwise we fall back to parsing the pcap directly.
     Both produce the same unified bundle, projected to Connection records for the
     detectors. If a static IOC prior from ST/DT is supplied, network findings
-    that match a static-extracted C2 are promoted to confirmed."""
+    that match a static-extracted C2 are promoted to confirmed.
+
+    When a handoff manifest is supplied, the bundle is first scoped to the guest
+    VM and detonation window (removes cross-VM / pre-post-detonation noise), and
+    manifest honesty-gates are applied to the resulting events."""
     bundle = load_bundle(pcap_path=pcap_path, zeek_dir=zeek_dir)
+    if handoff is not None:
+        from bundle_filter import filter_bundle
+        filter_bundle(bundle, guest_ip=handoff.guest_ip,
+                      start_utc=handoff.detonation_start_utc,
+                      end_utc=handoff.detonation_end_utc)
     conns = bundle.to_connections()
     beacons = detect_beaconing(conns)
     exfils = detect_exfil(conns, min_raw_upload_bytes=200 * 1024)
@@ -146,7 +156,7 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                 server_name = rec.server_name
                 break
         attr = attribute(b.dst_ip, ja3_hash=ja3_hash)
-        events.append({
+        ev = {
             "kind": "beacon",
             "dst_ip": b.dst_ip, "dst_port": b.dst_port,
             "timestamp": iso(first_ts.get((b.dst_ip, b.dst_port), conns[0].ts)),
@@ -155,10 +165,21 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
             "geo_country": attr.geo_country, "asn": attr.asn,
             "asn_org": attr.asn_org,
             "mean_interval_s": b.mean_interval_s, "jitter_ratio": b.jitter_ratio,
+            "handshake_ratio": b.handshake_ratio,
             "destination_domain": http_hosts.get(b.dst_ip) or server_name,
             "ja3_hash": ja3_hash,
             "plaintext_available": False,  # beacons are typically encrypted
-        })
+        }
+        # Retry storm to an unresponsive host (no completed handshake): perfectly
+        # periodic but not an established channel. Cap to weak with the reason,
+        # unless the IP is independently known-bad (reputation stands on its own).
+        if b.unanswered and not attr.reputation_hit:
+            ev["confidence_tier"] = "weak"
+            ev["beacon_note"] = (
+                f"no completed handshake ({b.handshake_ratio:.0%} of callbacks "
+                f"answered) — regular SYN retries to an unresponsive host mimic "
+                f"beaconing; not evidence of an established C2 channel")
+        events.append(ev)
 
     # --- TLS detections: known-bad fingerprint (JA3/JA4) + certificate ---
     # A destination whose TLS fingerprint is known-bad is malicious even with no
@@ -405,16 +426,28 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # nothing is hidden, only annotated. (F2)
     from allowlist import apply_allowlist
     apply_allowlist(events)
+
+    # --- handoff honesty-gates (network side) ---
+    # simulated_inetsim annotation + bad-clock capping of timing findings.
+    if handoff is not None:
+        from handoff import gate_network_events
+        build_network_events.last_notes = gate_network_events(events, handoff)
     return events
 
 
-def emit_schema_rows(network_events, correlated, sample_id):
+def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
     """Stage 4: fold everything into exfil_events rows with a hash chain.
 
-    Now populates ALL columns defined in sql/schema.sql:
-      asn, geo_country, ja3_hash, plaintext_available, destination_domain
+    Populates all shared-schema columns. When a handoff manifest is supplied,
+    rows carry the per-run join keys (session_id / cape_task_id) and the evidence
+    hash chain is SEEDED with the bundle's integrity.hash_manifest_sha256 so our
+    custody chain links to ST/DT's — the first row also records the seed value.
     """
-    rows, prev = [], "0" * 64
+    session_id = getattr(handoff, "session_id", None) if handoff else None
+    cape_task_id = getattr(handoff, "cape_task_id", None) if handoff else None
+    seed = (getattr(handoff, "hash_manifest_sha256", None) if handoff else None) \
+        or "0" * 64
+    rows, prev = [], seed
     # Correlated (host+network) events are the highest-value rows.
     for c in correlated:
         # Find matching network event for enrichment fields
@@ -426,6 +459,8 @@ def emit_schema_rows(network_events, correlated, sample_id):
         row = {
             "event_id": str(uuid.uuid4()),
             "sample_id": sample_id,
+            "session_id": session_id,
+            "cape_task_id": cape_task_id,
             "platform": "windows",
             "timestamp": c.network_ts,
             "data_type_accessed": c.data_type_accessed,
@@ -446,6 +481,8 @@ def emit_schema_rows(network_events, correlated, sample_id):
             # Prefer the technique resolved at ingestion; fall back to local map.
             "mitre_technique_id": c.mitre_technique_id or MITRE.get(c.data_type_accessed),
         }
+        if not rows and seed != "0" * 64:
+            row["manifest_sha256"] = seed   # link to ST/DT custody chain
         prev = hashlib.sha256((prev + json.dumps(row, sort_keys=True)).encode()).hexdigest()
         row["evidence_hash"] = prev
         rows.append(row)
@@ -454,6 +491,8 @@ def emit_schema_rows(network_events, correlated, sample_id):
         row = {
             "event_id": str(uuid.uuid4()),
             "sample_id": sample_id,
+            "session_id": session_id,
+            "cape_task_id": cape_task_id,
             "platform": "windows",
             "timestamp": e["timestamp"],
             "data_type_accessed": None,
@@ -474,6 +513,8 @@ def emit_schema_rows(network_events, correlated, sample_id):
                                      "confirmed" if e["reputation_hit"] else "weak"),
             "mitre_technique_id": MITRE.get(e["kind"]),
         }
+        if not rows and seed != "0" * 64:
+            row["manifest_sha256"] = seed   # link to ST/DT custody chain
         prev = hashlib.sha256((prev + json.dumps(row, sort_keys=True)).encode()).hexdigest()
         row["evidence_hash"] = prev
         rows.append(row)
@@ -484,14 +525,22 @@ def main():
     pcap = sys.argv[1] if len(sys.argv) > 1 else "data/sample_infostealer.pcap"
     acc_path = sys.argv[2] if len(sys.argv) > 2 else "data/access_events_fixture.json"
 
-    # Parse --zeek-dir / --static-prior flags if present
+    # Parse --zeek-dir / --static-prior / --handoff flags if present
     zeek_dir = None
     static_prior_path = None
+    handoff_path = None
     for i, arg in enumerate(sys.argv):
         if arg == "--zeek-dir" and i + 1 < len(sys.argv):
             zeek_dir = sys.argv[i + 1]
         if arg == "--static-prior" and i + 1 < len(sys.argv):
             static_prior_path = sys.argv[i + 1]
+        if arg == "--handoff" and i + 1 < len(sys.argv):
+            handoff_path = sys.argv[i + 1]
+
+    handoff = None
+    if handoff_path:
+        from handoff import load_handoff
+        handoff = load_handoff(handoff_path)
 
     sample_id = hashlib.sha256(open(pcap, "rb").read()).hexdigest()
 
@@ -511,7 +560,10 @@ def main():
     if zeek_dir:
         print(f"    JA3 enrichment from: {zeek_dir}")
     net = build_network_events(pcap, zeek_dir=zeek_dir,
-                               static_prior_path=static_prior_path)
+                               static_prior_path=static_prior_path,
+                               handoff=handoff)
+    analysis_notes = list(getattr(build_network_events, "last_notes", []) or [])
+    build_network_events.last_notes = []
     os.makedirs("output", exist_ok=True)
     with open("output/network_events.json", "w") as f:
         json.dump(net, f, indent=2)
@@ -541,17 +593,34 @@ def main():
         if sync.likely_skew:
             print(f"    [etw] CLOCK SKEW: {sync.note}")
     correlated = correlate(access_events, net, best_match=True)
+    # --- handoff honesty-gates (correlation side): cap timing/telemetry claims ---
+    if handoff is not None:
+        from handoff import gate_correlated
+        analysis_notes += gate_correlated(correlated, handoff)
     for c in correlated:
         print(f"    {c.data_type_accessed} ({c.mitre_technique_id}) -> {c.destination_ip} "
               f"({c.time_delta_s}s, {c.confidence_tier}, conf={c.correlation_confidence})")
 
+    if analysis_notes:
+        print("\n[!] Analysis caveats (handoff-derived):")
+        for n in analysis_notes:
+            print(f"    - {n}")
+        with open("output/analysis_notes.json", "w") as f:
+            json.dump({"notes": analysis_notes,
+                       "network_mode": getattr(handoff, "network_mode", None),
+                       "session_id": getattr(handoff, "session_id", None),
+                       "cape_task_id": getattr(handoff, "cape_task_id", None)}, f, indent=2)
+
     print("\n[*] Stage 4: emit shared exfil_events schema (hash-chained)")
-    rows = emit_schema_rows(net, correlated, sample_id)
+    rows = emit_schema_rows(net, correlated, sample_id, handoff=handoff)
     with open("output/exfil_events.json", "w") as f:
         json.dump(rows, f, indent=2)
     print(f"    Wrote {len(rows)} rows to output/exfil_events.json")
     if rows:
         print(f"    Evidence chain tip: {rows[-1]['evidence_hash'][:24]}...")
+        if handoff is not None and handoff.hash_manifest_sha256:
+            print(f"    Custody linked to ST/DT manifest: "
+                  f"{handoff.hash_manifest_sha256[:24]}...")
 
     # Stage 5: export IOCs
     print("\n[*] Stage 5: export IOCs (CSV + STIX 2.1)")

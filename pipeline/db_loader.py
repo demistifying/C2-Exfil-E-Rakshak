@@ -42,32 +42,34 @@ def load(events_path="output/exfil_events.json"):
         for r in rows:
             cur.execute(
                 """INSERT INTO exfil_events
-                   (event_id, sample_id, platform, timestamp,
+                   (event_id, sample_id, session_id, cape_task_id, platform, timestamp,
                     data_type_accessed, access_api_call,
                     destination_ip, destination_port,
                     destination_domain, asn, asn_org, geo_country,
                     reputation_score, reputation_note, reputation_source,
                     ja3_hash, plaintext_available,
                     confidence_score, confidence_tier,
-                    mitre_technique_id, evidence_hash)
-                   VALUES (%(event_id)s, %(sample_id)s, %(platform)s, %(timestamp)s,
+                    mitre_technique_id, manifest_sha256, evidence_hash)
+                   VALUES (%(event_id)s, %(sample_id)s, %(session_id)s, %(cape_task_id)s,
+                    %(platform)s, %(timestamp)s,
                     %(data_type_accessed)s, %(access_api_call)s,
                     %(destination_ip)s, %(destination_port)s,
                     %(destination_domain)s, %(asn)s, %(asn_org)s, %(geo_country)s,
                     %(reputation_score)s, %(reputation_note)s, %(reputation_source)s,
                     %(ja3_hash)s, %(plaintext_available)s,
                     %(confidence_score)s, %(confidence_tier)s,
-                    %(mitre_technique_id)s, %(evidence_hash)s)
+                    %(mitre_technique_id)s, %(manifest_sha256)s, %(evidence_hash)s)
                    ON CONFLICT (event_id) DO NOTHING""",
                 {k: r.get(k) for k in (
-                    "event_id", "sample_id", "platform", "timestamp",
+                    "event_id", "sample_id", "session_id", "cape_task_id",
+                    "platform", "timestamp",
                     "data_type_accessed", "access_api_call",
                     "destination_ip", "destination_port",
                     "destination_domain", "asn", "asn_org", "geo_country",
                     "reputation_score", "reputation_note", "reputation_source",
                     "ja3_hash", "plaintext_available",
                     "confidence_score", "confidence_tier",
-                    "mitre_technique_id", "evidence_hash")})
+                    "mitre_technique_id", "manifest_sha256", "evidence_hash")})
         conn.commit()
     print(f"[*] Loaded sample {sample_id[:16]}... ({tier}) with {len(rows)} events")
 
