@@ -8,11 +8,17 @@
 *.pcapng
 *.cap
 *.crdownload
-data/
+# Ignore data/ CONTENTS (not the dir itself) so specific subpaths can be
+# re-included below. (Git can't descend into a fully-excluded directory.)
+data/*
 
 # KEEP these two small fixtures (force-tracked below via `git add -f`):
 #   data/ground_truth.json
 #   data/access_events_fixture.json
+
+# KEEP shipped model artifacts + their training corpora (small, must ship:
+# inference needs the JSON weights; retraining needs the wordlist/benign lists).
+!data/models/
 
 # ---------- Generated / regenerable artifacts ----------
 output/

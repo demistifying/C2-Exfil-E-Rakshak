@@ -199,9 +199,11 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # often private, resolver) — so these are keyed by domain and their private
     # resolver IP is recorded but not filtered. A tunnel is multi-signal by
     # construction, so it is "strong" unless the resolver/domain is known-bad.
-    from dns_analysis import detect_dns_tunneling, detect_dga, detect_doh
+    from dns_analysis import (detect_dns_tunneling, detect_dga, detect_dga_ml,
+                              detect_doh)
     dns_ts = iso(min((q.ts for q in bundle.dns), default=conns[0].ts if conns else 0))
-    for f in detect_dns_tunneling(bundle.dns) + detect_dga(bundle.dns):
+    stat_dga = detect_dga(bundle.dns)
+    for f in detect_dns_tunneling(bundle.dns) + stat_dga:
         resolver = f.resolver_ips[0] if f.resolver_ips else ""
         rep = bool(resolver and attribute(resolver).reputation_hit)
         events.append({
@@ -212,6 +214,22 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
             "destination_domain": f.domain, "ja3_hash": None,
             "plaintext_available": True,
             "confidence_tier": "confirmed" if rep else "strong",
+            "dns_evidence": f.evidence,
+        })
+    # ML net for dictionary-DGAs the entropy heuristic misses. A lone learned
+    # signal -> weak candidate (explainable via the driving n-grams), unless the
+    # resolver is independently known-bad. Skips domains the heuristic already got.
+    stat_domains = {f.domain for f in stat_dga}
+    for f in detect_dga_ml(bundle.dns, already=stat_domains):
+        resolver = f.resolver_ips[0] if f.resolver_ips else ""
+        rep = bool(resolver and attribute(resolver).reputation_hit)
+        events.append({
+            "kind": "dga", "dst_ip": resolver, "dst_port": 53,
+            "timestamp": dns_ts, "confidence": f.confidence, "reputation_hit": rep,
+            "geo_country": None, "asn": None, "asn_org": None,
+            "destination_domain": f.domain, "ja3_hash": None,
+            "plaintext_available": True,
+            "confidence_tier": "confirmed" if rep else "weak",
             "dns_evidence": f.evidence,
         })
     doh_hits = detect_doh(bundle.tls, bundle.http)   # informational

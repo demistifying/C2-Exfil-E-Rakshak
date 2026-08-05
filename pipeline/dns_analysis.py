@@ -154,6 +154,60 @@ def detect_dga(dns, min_queries: int = 10,
     return []
 
 
+def detect_dga_ml(dns, min_prob: float = 0.75,
+                  already: set | None = None) -> list[DnsFinding]:
+    """ML net for DICTIONARY DGAs the entropy heuristic (`detect_dga`) misses.
+
+    suppobox/matsnu/gozi glue real words together, so Shannon entropy stays in
+    the benign band and the statistical detector never fires. The char-n-gram
+    model in `dga_classifier` learns that word-salad morphology. This runs per
+    distinct queried registered-domain and surfaces high-scoring ones as
+    *candidates* — weak tier by construction (a lone learned signal), with the
+    driving n-grams attached so the verdict is explainable, never asserted.
+
+    Degrades gracefully: if the model artifact isn't present, returns []. The
+    surfacing threshold (0.75) is deliberately above the model's 0.5 decision
+    boundary to protect precision on bulk benign DNS; the model itself still
+    classifies at 0.5 for evaluation.
+    """
+    try:
+        from dga_classifier import get_model
+    except Exception:
+        return []
+    model = get_model()
+    if model is None:
+        return []
+
+    already = already or set()
+    per: dict[str, dict] = defaultdict(lambda: {"n": 0, "resolvers": Counter()})
+    for q in dns:
+        dom = _registered_domain(q.query)
+        per[dom]["n"] += 1
+        if q.dst_ip:
+            per[dom]["resolvers"][q.dst_ip] += 1
+
+    findings: list[DnsFinding] = []
+    for dom, d in per.items():
+        if dom in already:
+            continue
+        sld = dom.split(".")[0]
+        if len(sld) < 8:                 # dictionary DGAs are long; skip short brands
+            continue
+        s = model.score(sld)
+        if s.probability < min_prob:
+            continue
+        top = ", ".join(f"{n.replace('ng:','').replace('f:','')}" for n, _ in s.top_features[:4])
+        findings.append(DnsFinding(
+            kind="dga_ml", domain=dom, query_count=d["n"],
+            avg_entropy=0.0, avg_sub_len=float(len(sld)),
+            tunnel_rt_fraction=0.0, unique_ratio=0.0, nxdomain_ratio=0.0,
+            confidence=round(float(s.probability), 2),
+            resolver_ips=[ip for ip, _ in d["resolvers"].most_common(3)],
+            evidence=f"ML DGA classifier p={s.probability:.2f} "
+                     f"(dictionary-DGA morphology; drivers: {top})"))
+    return findings
+
+
 def detect_doh(tls, http) -> list[str]:
     """Return destination domains that are known DoH endpoints (DNS-over-HTTPS).
     DoH is dual-use, so this is an informational signal, not a verdict."""
