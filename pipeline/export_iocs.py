@@ -41,9 +41,11 @@ def export_csv(events: list[dict], output_path: str = "output/iocs.csv") -> int:
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fieldnames = [
-        "destination_ip", "destination_port", "confidence_tier",
-        "confidence_score", "reputation_score", "mitre_technique_id",
-        "data_type_accessed", "timestamp", "evidence_hash",
+        "destination_ip", "destination_port", "destination_domain",
+        "confidence_tier", "confidence_score", "reputation_score",
+        "reputation_note", "reputation_source", "asn_org",
+        "mitre_technique_id", "data_type_accessed", "timestamp",
+        "evidence_hash",
     ]
 
     seen = set()
@@ -99,12 +101,16 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
             "id": indicator_id,
             "created": now,
             "modified": now,
-            "name": f"Malicious IP: {ip}",
+            "name": (f"Malicious IP: {ip}"
+                     + (f" — {e['reputation_note']}" if e.get("reputation_note") else "")),
             "description": (
                 f"Destination IP {ip}:{e.get('destination_port')} "
                 f"flagged as {e.get('confidence_tier', 'unknown')} "
                 f"by E-Rakshak Windows C2/Exfil module. "
-                f"MITRE: {e.get('mitre_technique_id', 'N/A')}."
+                + (f"Attribution: {e['reputation_note']} "
+                   f"(source: {e.get('reputation_source', 'n/a')}). "
+                   if e.get("reputation_note") else "")
+                + f"MITRE: {e.get('mitre_technique_id', 'N/A')}."
             ),
             "pattern": f"[ipv4-addr:value = '{ip}']",
             "pattern_type": "stix",
