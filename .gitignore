@@ -54,6 +54,9 @@ ENV/
 .coverage
 htmlcov/
 
+# ---------- Meeting Brief / Scratch ----------
+MEETING_BRIEF.md
+
 # ---------- IDE / editor ----------
 .idea/
 .vscode/

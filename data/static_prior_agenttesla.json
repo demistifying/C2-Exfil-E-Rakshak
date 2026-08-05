@@ -1,0 +1,14 @@
+{
+  "sample_sha256": "181f88f98bebc1e89701152bad54d15ec004988503b77d14425339467c60491b",
+  "family": "AgentTesla-style",
+  "c2_indicators": [
+    {
+      "type": "ip",
+      "value": "93.89.225.40"
+    },
+    {
+      "type": "domain",
+      "value": "dormant-c2-fallback.example.com"
+    }
+  ]
+}

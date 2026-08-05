@@ -124,7 +124,7 @@ def _run_matrix():
     print(f"{'scenario':<32}{'STOR?':>6}{'vol?':>6}{'rep?':>6}  flagged")
     print("-" * 72)
     for name, cl, sv, up, nbytes, v6, mal in SCENARIOS:
-        p = os.path.join(tmp, name.replace(" ", "_").replace("/", "") + ".pcap")
+        p = os.path.join(tmp, name.replace(" ", "_").replace("/", "").replace(">", "").replace("<", "") + ".pcap")
         write_session(p, cl, sv, upload=up, data_bytes=nbytes, v6=v6)
         conns = load_pcap(p)
         stor = bool(detect_ftp_exfil(conns))

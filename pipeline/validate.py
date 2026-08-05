@@ -66,10 +66,15 @@ def main():
         print(f"[!] No ground truth at {gt_path}"); sys.exit(1)
     ground_truth = json.load(open(gt_path))
 
-    malware = {k: v for k, v in ground_truth.items()
-               if v.get("malicious_ips") and not v.get("benign")}
-    benign = {k: v for k, v in ground_truth.items()
-              if v.get("benign") or not v.get("malicious_ips")}
+    # A sample is malware if it has ANY malicious indicator (IP or DOMAIN) and
+    # isn't explicitly benign. Checking only malicious_ips misclassified
+    # domain-only samples (e.g. dnscat2 -> cisco-update.com) as benign controls,
+    # turning their correct detection into a counted false positive.
+    def _is_malware(v):
+        return bool((v.get("malicious_ips") or v.get("malicious_domains"))
+                    and not v.get("benign"))
+    malware = {k: v for k, v in ground_truth.items() if _is_malware(v)}
+    benign = {k: v for k, v in ground_truth.items() if not _is_malware(v)}
 
     agg = {t: {"tp": 0, "fp": 0, "fn": 0} for t in THRESHOLDS}
 
