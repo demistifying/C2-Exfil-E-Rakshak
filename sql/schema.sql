@@ -26,9 +26,13 @@ CREATE TABLE IF NOT EXISTS exfil_events (
   access_api_call     TEXT,
   destination_ip      TEXT,
   destination_port    INTEGER,
+  destination_domain  TEXT,
   asn                 TEXT,
+  asn_org             TEXT,                    -- ASN owner (attribution context)
   geo_country         TEXT,
   reputation_score    REAL,
+  reputation_note     TEXT,                    -- e.g. 'RedLine Stealer C2 (feed: URLhaus)'
+  reputation_source   TEXT,                    -- which feed/intel named it
   ja3_hash            TEXT,
   plaintext_available BOOLEAN,
   confidence_score    REAL,

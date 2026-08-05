@@ -318,6 +318,18 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                 e["confidence_tier"] = "confirmed"
                 e["reputation_note"] = f"domain intel: {note or source}"
 
+    # --- attribution context enrichment ---
+    # Ensure every reputation-hit finding carries the human-meaningful "who"
+    # (source + note, e.g. "Redline Stealer C2") and asn_org — not just a 0/1
+    # score — so the attribution reaches the emitted evidence rows.
+    for e in events:
+        if e.get("reputation_hit") and not e.get("reputation_note"):
+            a = attribute(e["dst_ip"], ja3_hash=e.get("ja3_hash"), ja4=e.get("ja4"))
+            e["reputation_note"] = a.reputation_note
+            e["reputation_source"] = a.reputation_source
+            if not e.get("asn_org"):
+                e["asn_org"] = a.asn_org
+
     # --- confidence tiering ---
     # Count distinct behavioural signal TYPES per destination so a dst that
     # both beacons AND exfils is corroborated ("strong"), while a lone signal
@@ -404,8 +416,11 @@ def emit_schema_rows(network_events, correlated, sample_id):
             "destination_port": c.destination_port,
             "destination_domain": net_match.get("destination_domain") if net_match else None,
             "asn": net_match.get("asn") if net_match else None,
+            "asn_org": net_match.get("asn_org") if net_match else None,
             "geo_country": net_match.get("geo_country") if net_match else None,
             "reputation_score": 1.0 if c.reputation_hit else 0.0,
+            "reputation_note": net_match.get("reputation_note") if net_match else None,
+            "reputation_source": net_match.get("reputation_source") if net_match else None,
             "ja3_hash": net_match.get("ja3_hash") if net_match else None,
             "plaintext_available": net_match.get("plaintext_available") if net_match else None,
             "confidence_score": c.correlation_confidence,
@@ -429,8 +444,11 @@ def emit_schema_rows(network_events, correlated, sample_id):
             "destination_port": e["dst_port"],
             "destination_domain": e.get("destination_domain"),
             "asn": e.get("asn"),
+            "asn_org": e.get("asn_org"),
             "geo_country": e.get("geo_country"),
             "reputation_score": 1.0 if e["reputation_hit"] else 0.0,
+            "reputation_note": e.get("reputation_note"),
+            "reputation_source": e.get("reputation_source"),
             "ja3_hash": e.get("ja3_hash"),
             "plaintext_available": e.get("plaintext_available"),
             "confidence_score": e["confidence"],
