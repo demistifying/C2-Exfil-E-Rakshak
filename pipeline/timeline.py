@@ -62,6 +62,16 @@ def build_timeline(access_events, network_events, mitre_map=None) -> list[Timeli
     for e in network_events:
         tech = mitre_map.get(e.get("kind"))
         who = e.get("destination_domain") or e.get("dst_ip")
+        # A static_ioc is a C2 extracted from the BINARY that was NOT observed on
+        # the network (dormant). Don't label it as an observed network flow —
+        # that would overstate the evidence to a reviewer.
+        if e.get("kind") == "static_ioc":
+            entries.append(TimelineEntry(
+                timestamp=str(e.get("timestamp")), actor="static",
+                phase="c2-indicator", mitre=tech,
+                description=f"C2 in binary, not observed on network: {who}",
+                tier=e.get("confidence_tier")))
+            continue
         desc = f"{e.get('kind')} to {who}"
         det = (e.get("http_reason") or e.get("dns_evidence")
                or e.get("cloud_service") or e.get("covert_detail")

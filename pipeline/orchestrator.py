@@ -519,7 +519,11 @@ def main():
         flag = "  <-- KNOWN BAD" if e["reputation_hit"] else ""
         geo = f" [{e.get('geo_country') or '?'}]" if e.get("geo_country") else ""
         ja3 = f" ja3={e.get('ja3_hash')[:12]}..." if e.get("ja3_hash") else ""
-        print(f"    [{e['kind']:6}] {e['dst_ip']}:{e['dst_port']} "
+        # domain-only IOCs (e.g. dormant C2 from the binary) have no dst_ip —
+        # show the domain instead of a blank ':port'.
+        dest = e["dst_ip"] or e.get("destination_domain") or "?"
+        port = "" if not e["dst_ip"] else f":{e['dst_port']}"
+        print(f"    [{e['kind']:6}] {dest}{port} "
               f"conf={e['confidence']}{geo}{ja3}{flag}")
 
     fixture = os.path.exists(acc_path)

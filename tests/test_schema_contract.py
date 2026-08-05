@@ -108,3 +108,42 @@ def test_attribution_reaches_csv_export(tmp_path):
     text = open(out).read().lower()
     assert "reputation_note" in text, "CSV header missing attribution column"
     assert "redline" in text, "attribution reason absent from CSV IOC feed"
+
+
+# --- domain-only IOC must survive to BOTH exports (regression: STIX dropped it,
+#     CSV collapsed multiple onto an empty ("",port) key) ---
+
+def _domain_only_rows():
+    return [
+        {"event_id": "e1", "sample_id": "s", "destination_ip": "",
+         "destination_port": 0, "destination_domain": "validation.winstdt.test",
+         "confidence_tier": "strong", "confidence_score": 0.8,
+         "reputation_score": 0.0, "mitre_technique_id": "T1071",
+         "timestamp": "2026-08-05T15:17:48Z", "evidence_hash": "h1"},
+        {"event_id": "e2", "sample_id": "s", "destination_ip": "",
+         "destination_port": 0, "destination_domain": "c2.example.test",
+         "confidence_tier": "strong", "confidence_score": 0.8,
+         "reputation_score": 0.0, "mitre_technique_id": "T1071",
+         "timestamp": "2026-08-05T15:17:49Z", "evidence_hash": "h2"},
+    ]
+
+
+def test_domain_only_ioc_in_stix(tmp_path):
+    from pipeline.export_iocs import export_stix
+    out = str(tmp_path / "stix.json")
+    n = export_stix(_domain_only_rows(), out)
+    bundle = json.load(open(out))
+    inds = [o for o in bundle["objects"] if o["type"] == "indicator"]
+    # both domain IOCs must get their own domain-name indicator
+    assert n == 2 and len(inds) == 2
+    patterns = " ".join(i["pattern"] for i in inds)
+    assert "domain-name:value = 'validation.winstdt.test'" in patterns
+    assert "domain-name:value = 'c2.example.test'" in patterns
+
+
+def test_domain_only_iocs_not_collapsed_in_csv(tmp_path):
+    out = str(tmp_path / "iocs.csv")
+    n = export_csv(_domain_only_rows(), out)
+    text = open(out).read()
+    assert n == 2, "domain-only IOCs collapsed onto one row"
+    assert "validation.winstdt.test" in text and "c2.example.test" in text

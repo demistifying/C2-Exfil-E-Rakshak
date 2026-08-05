@@ -51,8 +51,10 @@ def export_csv(events: list[dict], output_path: str = "output/iocs.csv") -> int:
     seen = set()
     rows = []
     for e in events:
-        # Deduplicate by (ip, port) — keep highest confidence
-        key = (e.get("destination_ip"), e.get("destination_port"))
+        # Deduplicate by destination observable — IP if present, else domain, so
+        # multiple domain-only IOCs don't collapse onto an empty ("", port) key.
+        key = (e.get("destination_ip") or e.get("destination_domain"),
+               e.get("destination_port"))
         if key in seen:
             continue
         seen.add(key)
@@ -86,25 +88,27 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
     now = datetime.now(timezone.utc).isoformat()
     objects = []
 
-    # Deduplicate destinations
-    seen_ips = {}
+    # Deduplicate destinations by observable (IP preferred; a domain-only IOC —
+    # e.g. a C2 extracted from the binary but not resolved on the wire — still
+    # gets its own domain-name indicator instead of being silently dropped).
+    seen = {}
     for e in events:
-        ip = e.get("destination_ip")
-        if not ip or ip in seen_ips:
+        obs = _observable(e)
+        if obs is None or obs[0] in seen:
             continue
+        key, pattern, label = obs
 
-        # STIX Indicator
-        indicator_id = f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, ip)}"
+        indicator_id = f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, key)}"
         indicator = {
             "type": "indicator",
             "spec_version": "2.1",
             "id": indicator_id,
             "created": now,
             "modified": now,
-            "name": (f"Malicious IP: {ip}"
+            "name": (f"Malicious {label}"
                      + (f" — {e['reputation_note']}" if e.get("reputation_note") else "")),
             "description": (
-                f"Destination IP {ip}:{e.get('destination_port')} "
+                f"Destination {_dest_str(e)} "
                 f"flagged as {e.get('confidence_tier', 'unknown')} "
                 f"by E-Rakshak Windows C2/Exfil module. "
                 + (f"Attribution: {e['reputation_note']} "
@@ -112,7 +116,7 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
                    if e.get("reputation_note") else "")
                 + f"MITRE: {e.get('mitre_technique_id', 'N/A')}."
             ),
-            "pattern": f"[ipv4-addr:value = '{ip}']",
+            "pattern": pattern,
             "pattern_type": "stix",
             "valid_from": e.get("timestamp", now),
             "confidence": _stix_confidence(e.get("confidence_tier", "unconfirmed")),
@@ -129,13 +133,14 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
             }]
 
         objects.append(indicator)
-        seen_ips[ip] = indicator_id
+        seen[key] = indicator_id
 
     # STIX Observed-Data for each event
     for e in events:
-        ip = e.get("destination_ip")
-        if not ip:
+        obs = _observable(e)
+        if obs is None:
             continue
+        key = obs[0]
 
         obs_id = f"observed-data--{e.get('event_id', uuid.uuid4())}"
         observed = {
@@ -152,7 +157,7 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
         objects.append(observed)
 
         # Relationship: indicator → observed-data
-        if ip in seen_ips:
+        if key in seen:
             rel = {
                 "type": "relationship",
                 "spec_version": "2.1",
@@ -160,7 +165,7 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
                 "created": now,
                 "modified": now,
                 "relationship_type": "based-on",
-                "source_ref": seen_ips[ip],
+                "source_ref": seen[key],
                 "target_ref": obs_id,
             }
             objects.append(rel)
@@ -175,7 +180,7 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(bundle, f, indent=2)
 
-    return len(seen_ips)
+    return len(seen)
 
 
 def _stix_confidence(tier: str) -> int:
@@ -186,6 +191,29 @@ def _stix_confidence(tier: str) -> int:
         "weak": 40,
         "unconfirmed": 15,
     }.get(tier, 15)
+
+
+def _observable(e: dict):
+    """Return (dedup_key, STIX pattern, human label) for an event's destination.
+
+    IP is preferred; a domain-only IOC (no IP — e.g. a C2 domain extracted from
+    the binary but never resolved on the wire) still yields a domain-name
+    indicator instead of being dropped. Returns None if neither is present.
+    """
+    ip = e.get("destination_ip")
+    dom = e.get("destination_domain")
+    if ip:
+        return (f"ip:{ip}", f"[ipv4-addr:value = '{ip}']", f"IP: {ip}")
+    if dom:
+        return (f"domain:{dom}", f"[domain-name:value = '{dom}']", f"domain: {dom}")
+    return None
+
+
+def _dest_str(e: dict) -> str:
+    ip = e.get("destination_ip")
+    if ip:
+        return f"{ip}:{e.get('destination_port')}"
+    return e.get("destination_domain") or "unknown"
 
 
 def main():
