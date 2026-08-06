@@ -31,6 +31,21 @@ import os
 
 SUPPORTED_SCHEMA = "1.0"
 
+# A clock is "acceptable" for timing correlation if its uncertainty is small
+# relative to the 15 s correlation window. Some manifests carry an explicit
+# boolean; others (e.g. task-18) instead report maximum_uncertainty_ns from a
+# linear clock interpolation — derive acceptability from it.
+_CLOCK_UNCERTAINTY_LIMIT_NS = 5_000_000_000   # 5 s (< a third of the 15 s window)
+
+
+def _clock_acceptable(corr: dict) -> bool:
+    if "clock_quality_acceptable" in corr:
+        return bool(corr.get("clock_quality_acceptable"))
+    unc = corr.get("maximum_uncertainty_ns")
+    if isinstance(unc, (int, float)):
+        return unc <= _CLOCK_UNCERTAINTY_LIMIT_NS
+    return False   # unknown -> safe default (treat as not acceptable)
+
 # Timing-dependent detections: their confidence rests on when things happened,
 # so a bad clock invalidates them (caps to weak).
 _TIMING_KINDS = {"beacon"}
@@ -106,7 +121,7 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
         # default to the SAFE interpretation when the field is missing: assume the
         # clock is NOT acceptable and telemetry MAY be degraded, so we never
         # silently overstate.
-        clock_quality_acceptable=bool(corr.get("clock_quality_acceptable", False)),
+        clock_quality_acceptable=_clock_acceptable(corr),
         telemetry_degraded=bool(tel.get("telemetry_degraded", False)),
         providers_unavailable=providers,
         guest_ip=ident.get("guest_ip"),

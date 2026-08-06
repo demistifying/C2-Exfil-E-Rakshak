@@ -94,12 +94,23 @@ class PriorReport:
 
 
 def ingest_prior(raw: dict, *, strict: bool = False) -> PriorReport:
+    # family: native "family" or ST/DT "family_attribution": {"family": ...}
+    fam = raw.get("family")
+    if fam is None and isinstance(raw.get("family_attribution"), dict):
+        fam = raw["family_attribution"].get("family")
     prior = StaticPrior(
         sample_sha256=raw.get("sample_sha256"),
-        family=raw.get("family"),
-        capabilities=list(raw.get("capabilities") or []))
+        family=fam,
+        capabilities=list(raw.get("capabilities")
+                          or raw.get("capa_capabilities") or []))
     report = PriorReport(prior=prior)
-    for i, ind in enumerate(raw.get("c2_indicators") or []):
+    # Accept both our native "c2_indicators" and the ST/DT c2_static_prior schema
+    # key "iocs" (his bundle uses the latter), so the prior can be consumed
+    # directly without a conversion shim.
+    raw_iocs = raw.get("c2_indicators")
+    if raw_iocs is None:
+        raw_iocs = raw.get("iocs")
+    for i, ind in enumerate(raw_iocs or []):
         if not isinstance(ind, dict) or "type" not in ind or "value" not in ind:
             msg = f"c2_indicators[{i}] must have 'type' and 'value'"
             if strict:
@@ -136,16 +147,23 @@ class StaticCorrelation:
 
 
 def correlate_static_prior(prior: StaticPrior,
-                           network_events: list[dict]) -> list[StaticCorrelation]:
+                           network_events: list[dict],
+                           observed_ips: set | None = None,
+                           observed_domains: set | None = None) -> list[StaticCorrelation]:
     """For each static indicator, decide whether it was observed on the network.
 
     A network event matches if its destination IP or domain is one of the
-    indicator's match keys. Returns one correlation per indicator (observed or
-    dormant)."""
-    # index observed network destinations
+    indicator's match keys. `observed_ips`/`observed_domains` add destinations
+    seen in the RAW capture (all contacted IPs / queried domains) — crucial when
+    the C2 sits on a private address (e.g. a simulated_inetsim responder) that
+    the detectors' private-IP filter would otherwise hide, which would falsely
+    mark a contacted C2 as 'dormant'. Returns one correlation per indicator."""
+    # index observed network destinations (from detections + raw capture)
     net_ips = {e.get("dst_ip") for e in network_events if e.get("dst_ip")}
+    net_ips |= set(observed_ips or ())
     net_domains = {(e.get("destination_domain") or "").lower()
                    for e in network_events if e.get("destination_domain")}
+    net_domains |= {d.lower() for d in (observed_domains or ())}
     results: list[StaticCorrelation] = []
     for ind in prior.indicators:
         keys = ind.match_keys()

@@ -51,6 +51,16 @@ def _is_private_ip(ip: str) -> bool:
         return False
 
 
+def _skip_dst(ip: str, allow_dsts) -> bool:
+    """Skip private destinations EXCEPT those explicitly in scope.
+
+    `allow_dsts` carries the simulated-C2 responder IPs under simulated_inetsim:
+    the C2 sits on a private address, so blanket private-IP filtering would make
+    the analyzer blind to the whole detonation. An allow-listed private dst is
+    analysed like any external one."""
+    return _is_private_ip(ip) and (not allow_dsts or ip not in allow_dsts)
+
+
 # Zeek conn.log subset — this is the interface contract with the Zeek stage.
 @dataclass
 class Connection:
@@ -101,7 +111,8 @@ class ExfilVerdict:
 def detect_beaconing(conns: list[Connection],
                      min_count: int = 4,
                      max_jitter_ratio: float = 0.25,
-                     min_interval_s: float = 1.0) -> list[BeaconVerdict]:
+                     min_interval_s: float = 1.0,
+                     allow_dsts=None) -> list[BeaconVerdict]:
     """
     Groups connections by destination and flags those with regular timing.
     A low jitter ratio (stddev of inter-arrival times / mean) is the classic
@@ -125,7 +136,7 @@ def detect_beaconing(conns: list[Connection],
     """
     by_dst: dict[tuple[str, int], list[tuple[float, int, bool]]] = defaultdict(list)
     for c in conns:
-        if _is_private_ip(c.dst_ip):
+        if _skip_dst(c.dst_ip, allow_dsts):
             continue
         by_dst[(c.dst_ip, c.dst_port)].append(
             (c.ts, c.orig_bytes, _responded(c)))
@@ -188,7 +199,8 @@ def _responded(c: Connection) -> bool:
 def detect_exfil(conns: list[Connection],
                  min_upload_bytes: int = 1024,
                  min_upload_ratio: float = 0.7,
-                 min_raw_upload_bytes: int | None = None) -> list[ExfilVerdict]:
+                 min_raw_upload_bytes: int | None = None,
+                 allow_dsts=None) -> list[ExfilVerdict]:
     """
     Flags flows that push a lot of data OUT relative to what comes back.
     Data exfiltration shows up as an abnormally high upload ratio and/or a
@@ -196,7 +208,7 @@ def detect_exfil(conns: list[Connection],
     """
     verdicts: list[ExfilVerdict] = []
     for c in conns:
-        if _is_private_ip(c.dst_ip):
+        if _skip_dst(c.dst_ip, allow_dsts):
             continue
         total = c.orig_bytes + c.resp_bytes
         ratio = (c.orig_bytes / total) if total > 0 else 0.0
@@ -265,7 +277,8 @@ class EgressVerdict:
 
 def detect_unclassified_egress(conns: list[Connection], covered_dsts: set,
                                min_bytes: int = 2048,
-                               min_ratio: float = 0.6) -> list[EgressVerdict]:
+                               min_ratio: float = 0.6,
+                               allow_dsts=None) -> list[EgressVerdict]:
     """Content-agnostic net for UNKNOWN exfil channels.
 
     A signature/heuristic can only catch techniques it has a rule for. This is
@@ -279,7 +292,7 @@ def detect_unclassified_egress(conns: list[Connection], covered_dsts: set,
     verdicts: list[EgressVerdict] = []
     seen: set = set()
     for c in conns:
-        if _is_private_ip(c.dst_ip) or c.dst_ip in covered_dsts:
+        if _skip_dst(c.dst_ip, allow_dsts) or c.dst_ip in covered_dsts:
             continue
         total = c.orig_bytes + c.resp_bytes
         ratio = (c.orig_bytes / total) if total > 0 else 0.0
@@ -299,7 +312,7 @@ def detect_unclassified_egress(conns: list[Connection], covered_dsts: set,
 _FTP_UPLOAD_CMDS = ("STOR", "STOU", "APPE")
 
 
-def detect_ftp_exfil(conns: list[Connection]) -> list[ExfilVerdict]:
+def detect_ftp_exfil(conns: list[Connection], allow_dsts=None) -> list[ExfilVerdict]:
     """Flag FTP data exfiltration by the presence of a store command.
 
     Volume-based detection misses low-volume exfil: AgentTesla-style stealers
@@ -315,7 +328,7 @@ def detect_ftp_exfil(conns: list[Connection]) -> list[ExfilVerdict]:
     verdicts: list[ExfilVerdict] = []
     seen: set[str] = set()
     for c in conns:
-        if not c.ftp_upload_cmd or _is_private_ip(c.dst_ip):
+        if not c.ftp_upload_cmd or _skip_dst(c.dst_ip, allow_dsts):
             continue
         if c.dst_ip in seen:
             continue

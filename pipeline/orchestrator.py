@@ -70,20 +70,47 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     VM and detonation window (removes cross-VM / pre-post-detonation noise), and
     manifest honesty-gates are applied to the resulting events."""
     bundle = load_bundle(pcap_path=pcap_path, zeek_dir=zeek_dir)
+
+    # Resolve the guest VM identity + simulated-C2 scope. Under simulated_inetsim
+    # the C2 sits on a PRIVATE responder IP that the detectors' private-IP filter
+    # would otherwise discard, blinding the whole analysis. `allow_dsts` lets the
+    # detectors analyse exactly those responder IPs (guest->private-non-noise).
+    from bundle_filter import (filter_bundle, infer_guest_ip, simulated_c2_scope,
+                               _norm_guest_ip)
+    guest_ip = None
+    allow_dsts: set = set()
+    # Infrastructure IPs are never C2: the guest VM itself and its DNS resolver(s).
+    # A noisy static prior (e.g. Suricata-derived) can list these; contacting them
+    # is expected and must not be confirmed as C2. Resolvers are the resp_h of DNS.
+    infra_ips: set = {q.dst_ip for q in bundle.dns if getattr(q, "dst_ip", None)}
     if handoff is not None:
-        from bundle_filter import filter_bundle
-        filter_bundle(bundle, guest_ip=handoff.guest_ip,
+        guest_ip = _norm_guest_ip(handoff.guest_ip) or infer_guest_ip(bundle)
+        infra_ips.add(guest_ip)
+        filter_bundle(bundle, guest_ip=guest_ip,
                       start_utc=handoff.detonation_start_utc,
                       end_utc=handoff.detonation_end_utc)
+        if handoff.simulated:
+            # simulated C2 sits on a private responder — analyse it, but never the
+            # guest or the resolver (those are transport, not the C2 endpoint).
+            allow_dsts = simulated_c2_scope(bundle, guest_ip) - infra_ips
+    infra_ips.discard(None)
+
     conns = bundle.to_connections()
-    beacons = detect_beaconing(conns)
-    exfils = detect_exfil(conns, min_raw_upload_bytes=200 * 1024)
+    # raw contacted destinations (survive private-IP filtering) — used to decide
+    # whether a static IOC was actually reached. Excludes infrastructure so a
+    # resolver/guest in a noisy prior isn't falsely confirmed as a contacted C2.
+    raw_observed_ips = {c.dst_ip for c in conns
+                        if c.dst_ip and c.dst_ip not in infra_ips}
+    raw_observed_domains = {(q.query or "").lower() for q in bundle.dns if q.query}
+
+    beacons = detect_beaconing(conns, allow_dsts=allow_dsts)
+    exfils = detect_exfil(conns, min_raw_upload_bytes=200 * 1024, allow_dsts=allow_dsts)
 
     # FTP store-command exfil — catches low-volume FTP exfil (AgentTesla-style)
     # that the byte-threshold path misses. Merge in, skipping exact (ip, port)
     # duplicates already reported by the volume path.
     seen_exfil = {(e.dst_ip, e.dst_port) for e in exfils}
-    for fe in detect_ftp_exfil(conns):
+    for fe in detect_ftp_exfil(conns, allow_dsts=allow_dsts):
         if (fe.dst_ip, fe.dst_port) not in seen_exfil:
             exfils.append(fe)
             seen_exfil.add((fe.dst_ip, fe.dst_port))
@@ -327,7 +354,7 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # never leaves silently, without asserting more than we know.
     covered = {e["dst_ip"] for e in events}
     sni_by_ip = {t.dst_ip: t.server_name for t in bundle.tls if t.server_name}
-    for g in detect_unclassified_egress(conns, covered):
+    for g in detect_unclassified_egress(conns, covered, allow_dsts=allow_dsts):
         rep = bool(attribute(g.dst_ip).reputation_hit)
         events.append({
             "kind": "unclassified_egress", "dst_ip": g.dst_ip,
@@ -393,12 +420,24 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     if static_prior_path and os.path.exists(static_prior_path):
         from static_prior import load_static_prior, correlate_static_prior
         prior = load_static_prior(static_prior_path).prior
+        # Drop infrastructure IPs (guest VM, DNS resolver) if they leaked into the
+        # prior (e.g. a Suricata artifact) — the victim and its resolver are not C2.
+        if infra_ips:
+            prior.indicators = [ind for ind in prior.indicators
+                                if not (ind.type == "ip" and ind.value in infra_ips)]
         fam = f" ({prior.family})" if prior.family else ""
-        corr = correlate_static_prior(prior, events)
+        # Correlate against detections AND the raw capture, so a C2 that was
+        # actually contacted (even on a private/simulated responder) counts as
+        # observed rather than being mislabelled dormant.
+        corr = correlate_static_prior(prior, events,
+                                      observed_ips=raw_observed_ips,
+                                      observed_domains=raw_observed_domains)
         matched = set()
         for c in corr:
             if c.observed:
                 matched |= set(c.matched_dst)
+        event_ips = {e.get("dst_ip") for e in events}
+        event_doms = {(e.get("destination_domain") or "").lower() for e in events}
         for e in events:
             dom = (e.get("destination_domain") or "").lower()
             if e.get("dst_ip") in matched or (dom and dom in matched):
@@ -406,15 +445,33 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                 e["reputation_hit"] = True
                 e["static_match"] = f"matches static-extracted C2{fam}"
         for c in corr:
-            if not c.observed:
-                is_ip = c.indicator.type == "ip"
+            is_ip = c.indicator.type == "ip"
+            val = c.indicator.value
+            if c.observed:
+                # Observed on the wire but no specific detector fired for it
+                # (e.g. a single contact, or a simulated responder we can't fully
+                # classify) -> still confirm it as a contacted C2, don't drop it.
+                already = val in event_ips or val.lower() in event_doms
+                if not already:
+                    events.append({
+                        "kind": "static_ioc",
+                        "dst_ip": val if is_ip else "",
+                        "dst_port": 0, "timestamp": dns_ts, "confidence": 0.9,
+                        "reputation_hit": True, "geo_country": None, "asn": None,
+                        "asn_org": None,
+                        "destination_domain": None if is_ip else val,
+                        "ja3_hash": None, "plaintext_available": False,
+                        "confidence_tier": "confirmed",
+                        "static_match": f"static-extracted C2{fam} contacted on network",
+                    })
+            else:
                 events.append({
                     "kind": "static_ioc",
-                    "dst_ip": c.indicator.value if is_ip else "",
+                    "dst_ip": val if is_ip else "",
                     "dst_port": 0, "timestamp": dns_ts, "confidence": 0.8,
                     "reputation_hit": False, "geo_country": None, "asn": None,
                     "asn_org": None,
-                    "destination_domain": None if is_ip else c.indicator.value,
+                    "destination_domain": None if is_ip else val,
                     "ja3_hash": None, "plaintext_available": False,
                     "confidence_tier": "strong",
                     "static_note": f"C2 in binary{fam}, not observed on network (dormant)",
