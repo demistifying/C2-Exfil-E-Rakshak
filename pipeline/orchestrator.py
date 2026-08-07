@@ -694,19 +694,36 @@ def main():
             print(f"    [etw] ERROR: {err}")
     access_events = report.events
 
-    # ST/DT computes the guest->host clock offset in behavior/clock-sync.json.
-    # Apply it BEFORE skew assessment and correlation: previously we only
-    # detected skew and then re-derived what the sandbox already handed us.
+    # Clock handling: ST/DT ALREADY normalises access-event timestamps onto the
+    # host clock (correlation.clock_algorithm records how). We must not apply
+    # its offset again — on the task-18 bundle the guest ran ~1h behind, so a
+    # second correction would move correct timestamps by an hour and silently
+    # zero out correlation. Instead: verify the assumption, and take only the
+    # residual uncertainty to widen the matching window.
     if handoff is not None and access_events:
-        from handoff import apply_clock_offset
-        note = apply_clock_offset(access_events, handoff)
+        from handoff import verify_clock_alignment, correlation_window_slack_s
+        note = verify_clock_alignment(access_events, net, handoff)
         if note:
             print(f"    [etw] {note}")
             analysis_notes.append(note)
+        slack = correlation_window_slack_s(handoff)
+        if slack:
+            print(f"    [etw] clock uncertainty ±{slack * 1000:.0f} ms "
+                  f"({handoff.clock_algorithm or 'algorithm unstated'}) — "
+                  f"correlation window widened accordingly")
+        if handoff.access_events_rejected_count:
+            n = handoff.access_events_rejected_count
+            rej = (f"ACCESS EVENTS PARTIALLY REJECTED: ST/DT discarded {n} "
+                   f"event(s) before handoff (source: "
+                   f"{handoff.access_events_source or 'unstated'}); host-side "
+                   f"absence is correspondingly less conclusive.")
+            print(f"    [etw] {rej}")
+            analysis_notes.append(rej)
 
     # ST/DT can veto correlation outright when its own preconditions failed.
     # Honour that rather than producing timing claims it has disowned.
-    if handoff is not None and not handoff.host_network_correlation_enabled:
+    if handoff is not None and not (handoff.host_network_correlation_enabled
+                                    and handoff.access_events_correlation_eligible):
         reason = handoff.correlation_reason or "not stated"
         note = (f"HOST<->NETWORK CORRELATION DISABLED BY SANDBOX: {reason}. "
                 f"Access events were ingested but not correlated; network-side "

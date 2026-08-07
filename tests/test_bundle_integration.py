@@ -5,12 +5,20 @@ Covers contract fields that were present in the WinST/DT handoff manifest but
 not consumed on this side:
 
   1. correlation.access_events_path  — locate access events from the manifest
-  2. behavior/clock-sync.json        — APPLY the offset, not just detect skew
+  2. behavior/clock-sync.json        — consume the RESIDUAL UNCERTAINTY only
   3. capabilities.dynamic.tls_interception — branch the encrypted-traffic path
   4. sample.meta.json                — independent static corroboration
 
 Plus the correlation veto (host_network_correlation_enabled=false), which lets
 the sandbox disown timing claims its own preconditions could not support.
+
+On (2): ST/DT ALREADY normalises access-event timestamps onto the host clock.
+Verified against the real task-18 bundle — the guest ran ~3603.7s (about an
+hour) behind the host, yet its access_events already align with the PCAP to
+within seconds. Applying guest_minus_host_ns ourselves would move correct
+timestamps by an hour and silently zero out every correlation, so we take only
+the residual uncertainty (~502ms) and VERIFY the alignment rather than
+re-deriving it.
 """
 import os
 import sys
@@ -21,7 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
 
 import pytest
-from pipeline.handoff import (load_handoff, apply_clock_offset,
+from pipeline.handoff import (load_handoff, verify_clock_alignment,
                               correlation_window_slack_s, gate_network_events)
 from pipeline.sample_meta import (SampleMeta, ingest_sample_meta,
                                   load_sample_meta, load_from_handoff,
@@ -126,71 +134,115 @@ class TestAccessEventsPath:
 
 
 # --------------------------------------------------------------------------
-# 2. clock-sync.json — apply, don't just detect
+# 2. clock-sync.json — consume the UNCERTAINTY, never the offset
 # --------------------------------------------------------------------------
 
-def _acc(ts):
-    return {"timestamp": ts, "data_type": "browser_credentials",
-            "api_call": "CryptUnprotectData", "process": "stealer.exe"}
+class TestClockQuality:
+    """ST/DT pre-normalises access-event timestamps onto the HOST clock.
 
+    Verified against the real task-18 bundle: the guest ran ~3603.7s (about an
+    hour) behind the host, yet access_events (16:51:10-17:00:19) already align
+    with the PCAP (16:51:00-17:00:17). correlation.clock_algorithm records what
+    ST/DT DID; it is not an instruction to us. We therefore take the residual
+    uncertainty only — applying the offset again would move correct timestamps
+    by an hour and silently zero out every correlation.
+    """
 
-class TestClockOffset:
-    def test_flat_document_loaded(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={
-            "offset_ms": -420, "offset_uncertainty_ms": 50, "method": "midpoint"}))
-        assert h.clock_offset_ms == -420
-        assert h.clock_offset_uncertainty_ms == 50
-        assert h.clock_offset_source == "midpoint"
-        assert h.has_clock_offset
+    REAL = {
+        "schema_version": "1.0",
+        "algorithm": "http_date_midpoint_linear_interpolation",
+        "measurements": {
+            "start": {"guest_minus_host_ns": -3603710896854,
+                      "uncertainty_ns": 501224518},
+            "end": {"guest_minus_host_ns": -3603876647036,
+                    "uncertainty_ns": 501908965},
+        },
+        "quality": {"acceptable": True,
+                    "maximum_observed_uncertainty_ns": 501908965},
+    }
 
-    def test_nested_clock_key_also_loaded(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={
-            "clock": {"offset_ms": 1500, "offset_uncertainty_ms": 10}}))
-        assert h.clock_offset_ms == 1500
+    def test_real_shape_uncertainty_parsed(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock=self.REAL))
+        assert round(h.clock_uncertainty_ms, 1) == 501.9
+        assert h.clock_quality_reported is True
 
-    def test_absent_file_means_no_correction(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path))
-        assert h.clock_offset_ms == 0.0 and not h.has_clock_offset
-
-    def test_malformed_file_degrades_to_zero(self, tmp_path):
-        p = _bundle(tmp_path)
-        (tmp_path / "behavior" / "clock-sync.json").write_text("{not json")
-        h = load_handoff(p)
-        assert h.clock_offset_ms == 0.0
-
-    def test_offset_shifts_event_timestamps(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={
-            "offset_ms": 2000, "offset_uncertainty_ms": 25}))
-        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
-        events = [{"timestamp": base}]
-        note = apply_clock_offset(events, h)
-        assert events[0]["timestamp"] == base + timedelta(seconds=2)
-        assert "CLOCK OFFSET APPLIED" in note
-
-    def test_negative_offset_shifts_backwards(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={"offset_ms": -3000}))
-        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
-        events = [{"timestamp": base}]
-        apply_clock_offset(events, h)
-        assert events[0]["timestamp"] == base - timedelta(seconds=3)
-
-    def test_no_offset_leaves_timestamps_untouched(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path))
-        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
-        events = [{"timestamp": base}]
-        assert apply_clock_offset(events, h) is None
-        assert events[0]["timestamp"] == base
+    def test_no_appliable_offset_is_exposed(self, tmp_path):
+        """Regression guard: an hour-sized offset sits in the file. If it ever
+        leaks into an appliable attribute, correlation breaks silently."""
+        h = load_handoff(_bundle(tmp_path, clock=self.REAL))
+        assert not [a for a in dir(h) if "offset" in a]
 
     def test_uncertainty_widens_correlation_window(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={
-            "offset_ms": 0, "offset_uncertainty_ms": 2500}))
-        assert correlation_window_slack_s(h) == 2.5
+        h = load_handoff(_bundle(tmp_path, clock=self.REAL))
+        assert round(correlation_window_slack_s(h), 3) == 0.502
         assert correlation_window_slack_s(None) == 0.0
 
-    def test_string_timestamps_are_skipped_not_crashed(self, tmp_path):
-        h = load_handoff(_bundle(tmp_path, clock={"offset_ms": 1000}))
-        events = [{"timestamp": "2026-08-05T10:14:00+00:00"}]
-        assert apply_clock_offset(events, h) is None   # nothing parseable shifted
+    def test_algorithm_falls_back_to_clock_sync_file(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock=self.REAL))
+        assert h.clock_algorithm == "http_date_midpoint_linear_interpolation"
+
+    def test_manifest_algorithm_takes_precedence(self, tmp_path):
+        """The real bundle states the algorithm in correlation.clock_algorithm;
+        that is the authoritative record of what ST/DT applied."""
+        m = _manifest(correlation={
+            "access_events_path": "behavior/access_events.json",
+            "event_count": 3,
+            "clock_algorithm": "linear_start_end_interpolation",
+            "maximum_uncertainty_ns": 501908965,
+            "host_network_correlation_enabled": True,
+            "reason_code": None})
+        h = load_handoff(_bundle(tmp_path, manifest=m, clock=self.REAL))
+        assert h.clock_algorithm == "linear_start_end_interpolation"
+
+    def test_falls_back_to_worst_measurement(self, tmp_path):
+        doc = {"algorithm": "x", "measurements": {
+            "start": {"uncertainty_ns": 200_000_000},
+            "end": {"uncertainty_ns": 900_000_000}}}
+        h = load_handoff(_bundle(tmp_path, clock=doc))
+        assert round(h.clock_uncertainty_ms) == 900
+
+    def test_absent_file(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert h.clock_uncertainty_ms == 0.0 and h.clock_quality_reported is None
+
+    def test_malformed_file_degrades(self, tmp_path):
+        p = _bundle(tmp_path)
+        (tmp_path / "behavior" / "clock-sync.json").write_text("{not json")
+        assert load_handoff(p).clock_uncertainty_ms == 0.0
+
+
+class TestClockAlignmentGuard:
+    """Verify ST/DT actually pre-corrected — but never auto-correct, because a
+    wrong guess is worse than a flagged mismatch."""
+
+    def _ev(self, iso):
+        return {"timestamp": datetime.fromisoformat(iso)}
+
+    def test_aligned_timelines_no_warning(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        acc = [self._ev("2026-08-05T16:51:10+00:00"), self._ev("2026-08-05T17:00:19+00:00")]
+        net = [self._ev("2026-08-05T16:51:00+00:00"), self._ev("2026-08-05T17:00:17+00:00")]
+        assert verify_clock_alignment(acc, net, h) is None
+
+    def test_hour_offset_flagged_not_corrected(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        acc = [self._ev("2026-08-05T15:51:10+00:00")]      # raw guest time
+        net = [self._ev("2026-08-05T16:51:00+00:00")]
+        before = acc[0]["timestamp"]
+        note = verify_clock_alignment(acc, net, h)
+        assert note and "CLOCK ALIGNMENT SUSPECT" in note and "NOT auto-corrected" in note
+        assert acc[0]["timestamp"] == before               # untouched
+
+    def test_string_timestamps_supported(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert verify_clock_alignment(
+            [{"timestamp": "2026-08-05T15:51:10+00:00"}],
+            [{"timestamp": "2026-08-05T16:51:00+00:00"}], h) is not None
+
+    def test_empty_inputs_noop(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert verify_clock_alignment([], [{"timestamp": 1.0}], h) is None
+        assert verify_clock_alignment([{"timestamp": 1.0}], [], h) is None
 
 
 # --------------------------------------------------------------------------

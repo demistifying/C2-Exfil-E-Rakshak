@@ -51,6 +51,13 @@ def _clock_acceptable(corr: dict) -> bool:
 # so a bad clock invalidates them (caps to weak).
 _TIMING_KINDS = {"beacon"}
 
+# How far the host-access and network timelines may legitimately differ before
+# we suspect the two clocks are not aligned at all. Generous on purpose: access
+# events and network events genuinely cluster differently within a detonation,
+# so this must not fire on normal skew. A real misalignment (task-18's guest ran
+# ~3600s behind) clears this by more than an order of magnitude.
+_ALIGNMENT_TOLERANCE_S = 120.0
+
 # Best-effort ETW-provider -> data_type map (substring, case-insensitive). Used
 # to scope telemetry-degradation capping. Configurable via
 # data/provider_data_type_map.json; if a degraded provider matches nothing, we
@@ -95,12 +102,32 @@ class Handoff:
     sample_meta_path: str | None = None
     pcap_path: str | None = None
 
-    # --- clock correction (behavior/clock-sync.json) -------------------------
-    # ST/DT computes the guest->host offset; we used to only DETECT skew and
-    # then re-derive it ourselves. Now we apply what it hands us.
-    clock_offset_ms: float = 0.0
-    clock_offset_uncertainty_ms: float = 0.0
-    clock_offset_source: str | None = None
+    # access_events.status.json sidecar
+    access_events_source: str | None = None          # e.g. 'cape_capemon'
+    access_events_correlation_eligible: bool = True
+    access_events_rejected_count: int = 0
+    etw_corroboration_state: str | None = None
+
+    # --- clock QUALITY (behavior/clock-sync.json) ---------------------------
+    # IMPORTANT — read before touching this.
+    #
+    # ST/DT ALREADY normalises access-event timestamps onto the HOST clock
+    # before writing them. `correlation.clock_algorithm` (e.g.
+    # "linear_start_end_interpolation") describes what it ALREADY DID; it is a
+    # provenance statement, not an instruction to us.
+    #
+    # Verified on the task-18 bundle: the guest clock ran ~3603.7 s (about one
+    # hour) behind the host, yet access_events span 16:51:10–17:00:19 and the
+    # PCAP spans 16:51:00–17:00:17. They are already aligned.
+    #
+    # So we must NEVER apply guest_minus_host_ns ourselves — doing so would
+    # shift correct timestamps by an hour and silently destroy every
+    # correlation. What we take from this file is the RESIDUAL UNCERTAINTY left
+    # after their interpolation (~502 ms here), which legitimately widens our
+    # matching window, plus their own quality verdict.
+    clock_uncertainty_ms: float = 0.0
+    clock_algorithm: str | None = None
+    clock_quality_reported: bool | None = None       # clock-sync quality.acceptable
 
     # --- encrypted-traffic branch (capabilities.dynamic.tls_interception) ----
     tls_interception_status: str | None = None
@@ -120,10 +147,6 @@ class Handoff:
     @property
     def tls_plaintext_available(self) -> bool:
         return self.tls_interception_status == "intercepted"
-
-    @property
-    def has_clock_offset(self) -> bool:
-        return bool(self.clock_offset_ms) or bool(self.clock_offset_uncertainty_ms)
 
 
 def load_handoff(path: str, *, strict: bool = False) -> Handoff:
@@ -164,8 +187,13 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
                or apaths.get("access_events")
                or "behavior/access_events.json")
 
-    offset_ms, unc_ms, off_src = _load_clock_sync(
+    unc_ms, clock_algo, clock_ok = _load_clock_quality(
         _resolve(apaths.get("clock_sync") or "behavior/clock-sync.json"))
+
+    status_rel = (corr.get("access_events_status_path")
+                  or apaths.get("access_events_status")
+                  or "behavior/access_events.status.json")
+    ae_status = _load_access_events_status(_resolve(status_rel))
 
     return Handoff(
         schema_version=sv,
@@ -192,41 +220,81 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
         # correlation preconditions were not met.
         host_network_correlation_enabled=bool(
             corr.get("host_network_correlation_enabled", True)),
-        correlation_reason=corr.get("reason"),
+        # real bundles use 'reason_code'; earlier drafts used 'reason'
+        correlation_reason=corr.get("reason_code") or corr.get("reason")
+        or ae_status.get("reason_code"),
         sample_meta_path=_resolve("sample.meta.json"),
         pcap_path=_resolve(apaths.get("pcap") or "network/capture.pcapng"),
-        clock_offset_ms=offset_ms,
-        clock_offset_uncertainty_ms=unc_ms,
-        clock_offset_source=off_src,
+        access_events_source=(ae_status.get("source") or corr.get("source")),
+        access_events_correlation_eligible=bool(
+            ae_status.get("correlation_eligible", True)),
+        access_events_rejected_count=int(
+            ae_status.get("rejected_event_count") or 0),
+        etw_corroboration_state=(ae_status.get("etw_corroboration_state")
+                                 or corr.get("etw_corroboration_state")),
+        clock_uncertainty_ms=unc_ms,
+        clock_algorithm=corr.get("clock_algorithm") or clock_algo,
+        clock_quality_reported=clock_ok,
         tls_interception_status=_tls_status(raw),
     )
 
 
-def _load_clock_sync(path: str | None) -> tuple[float, float, str | None]:
-    """Read ST/DT's computed guest->host clock offset.
+def _load_clock_quality(path: str | None) -> tuple[float, str | None, bool | None]:
+    """Read the RESIDUAL uncertainty from ST/DT's clock-sync record.
 
-    Accepts either a flat {offset_ms, offset_uncertainty_ms} document or one
-    nested under a "clock" key, since the ST/DT side has used both shapes.
-    Missing/unparseable -> (0, 0, None), i.e. no correction, which is the same
-    behaviour as before this was wired.
+    Returns (uncertainty_ms, algorithm, reported_acceptable).
+
+    We deliberately do NOT read guest_minus_host_ns. ST/DT has already applied
+    it when writing access_events (see the note on Handoff.clock_uncertainty_ms);
+    re-applying it here would shift correct timestamps by the full offset — an
+    hour, on the task-18 bundle — and silently break every correlation.
+
+    Real shape (task-18):
+        {"algorithm": "...",
+         "measurements": {"start": {...,"uncertainty_ns": N},
+                          "end":   {...,"uncertainty_ns": N}},
+         "quality": {"acceptable": true, "maximum_observed_uncertainty_ns": N}}
     """
     if not path or not os.path.exists(path):
-        return 0.0, 0.0, None
+        return 0.0, None, None
     try:
         doc = json.load(open(path, encoding="utf-8"))
     except Exception:
-        return 0.0, 0.0, None
-    if isinstance(doc.get("clock"), dict):
-        doc = doc["clock"]
+        return 0.0, None, None
+    if not isinstance(doc, dict):
+        return 0.0, None, None
+
+    quality = doc.get("quality") if isinstance(doc.get("quality"), dict) else {}
+    acceptable = quality.get("acceptable")
+    acceptable = bool(acceptable) if isinstance(acceptable, bool) else None
+
+    unc_ns = quality.get("maximum_observed_uncertainty_ns")
+    if not isinstance(unc_ns, (int, float)):
+        # fall back to the worst per-measurement uncertainty
+        seen = []
+        meas = doc.get("measurements")
+        if isinstance(meas, dict):
+            for leg in meas.values():
+                if isinstance(leg, dict) and isinstance(
+                        leg.get("uncertainty_ns"), (int, float)):
+                    seen.append(leg["uncertainty_ns"])
+        unc_ns = max(seen) if seen else 0
+
     try:
-        off = float(doc.get("offset_ms", 0) or 0)
+        unc_ms = abs(float(unc_ns)) / 1e6
     except (TypeError, ValueError):
-        off = 0.0
+        unc_ms = 0.0
+    return unc_ms, doc.get("algorithm"), acceptable
+
+
+def _load_access_events_status(path: str | None) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
     try:
-        unc = abs(float(doc.get("offset_uncertainty_ms", 0) or 0))
-    except (TypeError, ValueError):
-        unc = 0.0
-    return off, unc, doc.get("method") or "clock-sync.json"
+        doc = json.load(open(path, encoding="utf-8"))
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
 
 
 def _tls_status(raw: dict) -> str | None:
@@ -242,45 +310,62 @@ def _tls_status(raw: dict) -> str | None:
     return tls.get("status")
 
 
-def apply_clock_offset(events: list, h: Handoff | None) -> str | None:
-    """Shift host access-event timestamps onto the network capture's clock.
-
-    ST/DT timestamps access events on the GUEST clock; the PCAP is timestamped
-    on the HOST tap. Correlation compares the two, so an uncorrected offset
-    silently produces false negatives (or, worse, false positives at the window
-    edge). `offset_ms` is the correction to ADD to a guest timestamp to express
-    it on the host clock.
-
-    Mutates events in place. Returns a human-readable note, or None if there was
-    nothing to apply.
-    """
-    if h is None or not h.has_clock_offset or not events:
-        return None
-    delta = timedelta(milliseconds=h.clock_offset_ms)
-    shifted = 0
-    for e in events:
-        ts = e.get("timestamp") if isinstance(e, dict) else getattr(e, "timestamp", None)
-        if not isinstance(ts, datetime):
-            continue
-        if isinstance(e, dict):
-            e["timestamp"] = ts + delta
-        else:
-            setattr(e, "timestamp", ts + delta)
-        shifted += 1
-    if not shifted:
-        return None
-    return (f"CLOCK OFFSET APPLIED: {h.clock_offset_ms:+.0f} ms "
-            f"(±{h.clock_offset_uncertainty_ms:.0f} ms, source: "
-            f"{h.clock_offset_source}) to {shifted} host access event(s) to "
-            f"align the guest clock with the PCAP capture clock.")
-
-
 def correlation_window_slack_s(h: Handoff | None) -> float:
-    """Extra seconds to widen the correlation window by, so a stated clock
-    uncertainty is accounted for rather than silently ignored."""
+    """Extra seconds to widen the correlation window by, so ST/DT's stated
+    residual uncertainty is accounted for rather than silently ignored.
+
+    This is the ONLY thing we take from clock-sync.json. See the note on
+    Handoff.clock_uncertainty_ms for why we never apply the offset itself.
+    """
     if h is None:
         return 0.0
-    return h.clock_offset_uncertainty_ms / 1000.0
+    return h.clock_uncertainty_ms / 1000.0
+
+
+def verify_clock_alignment(events: list, network_events: list,
+                           h: Handoff | None) -> str | None:
+    """Guard: confirm access events look PRE-CORRECTED onto the host clock.
+
+    We rely on ST/DT normalising timestamps before it writes them. That is an
+    assumption about someone else's code, so verify it instead of trusting it:
+    if their pipeline ever regresses to emitting raw guest time, the symptom
+    would otherwise be a silent collapse to zero correlations.
+
+    Compares the medians of the two timelines. A gap far larger than any
+    plausible correlation window means the two clocks are not aligned. We
+    REPORT it — we never silently correct, because a wrong correction is worse
+    than a flagged mismatch.
+    """
+    if not events or not network_events:
+        return None
+
+    def _epoch(x):
+        ts = x.get("timestamp") if isinstance(x, dict) else getattr(x, "timestamp", None)
+        if isinstance(ts, datetime):
+            return ts.timestamp()
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        if isinstance(ts, str):
+            try:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    a = sorted(t for t in (_epoch(e) for e in events) if t is not None)
+    n = sorted(t for t in (_epoch(e) for e in network_events) if t is not None)
+    if not a or not n:
+        return None
+
+    gap = a[len(a) // 2] - n[len(n) // 2]
+    if abs(gap) <= _ALIGNMENT_TOLERANCE_S:
+        return None
+    return (f"CLOCK ALIGNMENT SUSPECT: host access events sit {gap:+.0f}s from "
+            f"the network capture (algorithm reported: {h.clock_algorithm if h else 'n/a'}). "
+            f"ST/DT is expected to pre-normalise access-event timestamps onto the "
+            f"host clock; this gap suggests it did not. Correlations for this run "
+            f"are unreliable — NOT auto-corrected, because guessing the offset is "
+            f"worse than reporting the mismatch.")
 
 
 def _jsonschema_validate(raw: dict, *, strict: bool) -> None:
