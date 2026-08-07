@@ -6,7 +6,7 @@ in collaboration with the Windows ST/DT sandbox module, produces attributed,
 evidence-graded C2/exfiltration findings in a schema shared with the Android
 module.
 
-**Snapshot (Phases 1–4 core complete):** **325 tests passing.** Adds host↔network
+**Snapshot (Phases 1–4 core complete):** **328 tests passing.** Adds host↔network
 correlation hardening (best-match, clock-sync guarded) and **item-level exfil
 provenance** — "which stolen item left via what channel to which destination,
 when" — tested across every item type, every exfil protocol, negatives, window
@@ -124,7 +124,7 @@ external dependency (ETW host events) has a built, tested ingestion interface.
 
 ## 3. Testing — what is covered
 
-**325 tests, all passing** across 24 files. Highest-value groups:
+**328 tests, all passing** across 24 files. Highest-value groups:
 
 | Test file | Tests | Covers |
 |---|---:|---|
@@ -176,7 +176,7 @@ traffic.
 - **DNS tunneling / exfil — ADDRESSED.** `dns_analysis.py` (tunnelling, DoH,
   volumetric/entropy signals) plus an offline explainable DGA classifier
   (`dga_classifier.py`, auditable JSON weights) are implemented and tested
-  against a dnscat2 capture. *Remaining:* iodine samples for a second tunnelling
+  against a dnscat2 capture. *Remaining:* validate against the iodine/dns2tcp/dnsexfiltrator captures already in `data/dns-exfiltration-dataset/` (9 families, unused so far) for a second tunnelling
   implementation, and low-and-slow validation.
 - **FTPS / encrypted FTP — MITIGATED.** An encrypted `STOR` is invisible to the
   payload detector, but the session is still caught by a known-bad JA3/JA4

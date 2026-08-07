@@ -89,6 +89,8 @@ class Handoff:
     hash_manifest_sha256: str | None = None
     path: str | None = None
     raw: dict = field(default_factory=dict)
+    # 'validated' | 'skipped: ...' | 'failed: ...'  — never silently unknown
+    schema_validation: str = "not_attempted"
 
     # --- bundle-resolved artifact paths + the ST/DT correlation gate ---------
     # manifest.correlation tells us where the access events are, how many to
@@ -166,7 +168,7 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
         if strict:
             raise ValueError(msg)
 
-    _jsonschema_validate(raw, strict=strict)
+    schema_status = _jsonschema_validate(raw, strict=strict)
 
     corr = raw.get("correlation") or {}
     tel = raw.get("telemetry") or {}
@@ -212,6 +214,7 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
         hash_manifest_sha256=integ.get("hash_manifest_sha256"),
         path=path,
         raw=raw,
+        schema_validation=schema_status,
         bundle_dir=bundle_dir,
         access_events_path=_resolve(acc_rel),
         access_event_count=corr.get("event_count"),
@@ -368,22 +371,39 @@ def verify_clock_alignment(events: list, network_events: list,
             f"worse than reporting the mismatch.")
 
 
-def _jsonschema_validate(raw: dict, *, strict: bool) -> None:
+def _jsonschema_validate(raw: dict, *, strict: bool) -> str:
+    """Validate the manifest against ST/DT's published schema, if we have it.
+
+    Returns a status string rather than nothing, because the previous version
+    returned silently on BOTH the "library missing" and "schema file missing"
+    paths — so the module claimed to mirror his Rust validator while in practice
+    never validating anything. `schemas/` does not exist in this repo, so that
+    was the case on every run.
+
+    Note also that his COMMITTED handoff_manifest.schema.json does not accept
+    his own real output: the task-18 manifest's correlation block carries
+    `reason_code`, `source`, `clock_algorithm`, `etw_corroboration_state` and
+    `maximum_uncertainty_ns`, while the schema requires `clock_quality_acceptable`
+    and `reason` under `additionalProperties: false`. Dropping that schema in
+    would fail every real bundle, so it is deliberately NOT vendored here.
+    """
     try:
         import jsonschema  # type: ignore
     except Exception:
-        return
+        return "skipped: jsonschema not installed"
     schema_path = os.path.join(os.path.dirname(__file__), "..",
                                "schemas", "handoff_manifest.schema.json")
     if not os.path.exists(schema_path):
-        return
+        return "skipped: schemas/handoff_manifest.schema.json not vendored"
     try:
         schema = json.load(open(schema_path, encoding="utf-8"))
         jsonschema.validate(raw, schema)
+        return "validated"
     except Exception as e:  # ValidationError or schema error
         if strict:
             raise
-        # non-strict: swallow; the structural extraction below is defensive
+        # non-strict: report; the structural extraction below is defensive
+        return f"failed: {type(e).__name__}: {str(e).splitlines()[0][:120]}"
 
 
 def _provider_map() -> dict:
