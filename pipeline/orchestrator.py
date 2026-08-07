@@ -578,26 +578,74 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
     return rows
 
 
-def main():
-    pcap = sys.argv[1] if len(sys.argv) > 1 else "data/sample_infostealer.pcap"
-    acc_path = sys.argv[2] if len(sys.argv) > 2 else "data/access_events_fixture.json"
+_VALUE_FLAGS = ("--zeek-dir", "--static-prior", "--handoff")
 
-    # Parse --zeek-dir / --static-prior / --handoff flags if present
-    zeek_dir = None
-    static_prior_path = None
-    handoff_path = None
-    for i, arg in enumerate(sys.argv):
-        if arg == "--zeek-dir" and i + 1 < len(sys.argv):
-            zeek_dir = sys.argv[i + 1]
-        if arg == "--static-prior" and i + 1 < len(sys.argv):
-            static_prior_path = sys.argv[i + 1]
-        if arg == "--handoff" and i + 1 < len(sys.argv):
-            handoff_path = sys.argv[i + 1]
+
+def parse_args(argv: list[str]) -> dict:
+    """Split argv into positionals and flag values.
+
+    Positionals are [pcap] [access_events]. Anything starting with '--' is a
+    flag and must never be mistaken for a path — previously
+    `orchestrator.py x.pcap --handoff m.json` silently bound acc_path to the
+    literal string "--handoff", which failed os.path.exists() and disabled
+    correlation with no explanation.
+    """
+    flags: dict = {"zeek_dir": None, "static_prior_path": None, "handoff_path": None}
+    key_for = {"--zeek-dir": "zeek_dir", "--static-prior": "static_prior_path",
+               "--handoff": "handoff_path"}
+    consumed: set[int] = set()
+    for i, a in enumerate(argv):
+        if a in _VALUE_FLAGS and i + 1 < len(argv):
+            flags[key_for[a]] = argv[i + 1]
+            consumed.add(i)
+            consumed.add(i + 1)
+    positional = [a for i, a in enumerate(argv)
+                  if i not in consumed and not a.startswith("--")]
+    return {
+        "pcap": positional[0] if positional else "data/sample_infostealer.pcap",
+        # None means "not given" -> the handoff manifest may supply it.
+        "acc_path_explicit": positional[1] if len(positional) > 1 else None,
+        **flags,
+    }
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+    pcap = args["pcap"]
+    acc_path_explicit = args["acc_path_explicit"]
+    acc_path = acc_path_explicit or "data/access_events_fixture.json"
+    zeek_dir = args["zeek_dir"]
+    static_prior_path = args["static_prior_path"]
+    handoff_path = args["handoff_path"]
 
     handoff = None
+    sample_meta = None
     if handoff_path:
         from handoff import load_handoff
         handoff = load_handoff(handoff_path)
+
+        # Resolve the access events from manifest.correlation.access_events_path
+        # rather than making the caller pass it. An explicit positional argument
+        # still wins, so existing invocations behave exactly as before.
+        if acc_path_explicit is None and handoff.access_events_path:
+            if os.path.exists(handoff.access_events_path):
+                acc_path = handoff.access_events_path
+                n = handoff.access_event_count
+                print(f"[*] access events resolved from manifest: {acc_path}"
+                      + (f" (expecting {n})" if n is not None else ""))
+
+        # sample.meta.json — independent, binary-derived corroboration.
+        from sample_meta import load_from_handoff
+        sample_meta = load_from_handoff(handoff)
+        if sample_meta.ok:
+            fam = sample_meta.family
+            sig = sample_meta.corroborating_signals()
+            print(f"[*] sample.meta.json: "
+                  f"family={fam or 'unknown'}, "
+                  f"independent signals={sig or 'none'}")
+        else:
+            print(f"[*] sample.meta.json unavailable ({'; '.join(sample_meta.errors)})")
+            sample_meta = None
 
     sample_id = hashlib.sha256(open(pcap, "rb").read()).hexdigest()
 
@@ -645,15 +693,45 @@ def main():
         for err in report.errors:
             print(f"    [etw] ERROR: {err}")
     access_events = report.events
-    if access_events:
-        sync = assess_clock_sync(access_events, net)
-        if sync.likely_skew:
-            print(f"    [etw] CLOCK SKEW: {sync.note}")
-    correlated = correlate(access_events, net, best_match=True)
+
+    # ST/DT computes the guest->host clock offset in behavior/clock-sync.json.
+    # Apply it BEFORE skew assessment and correlation: previously we only
+    # detected skew and then re-derived what the sandbox already handed us.
+    if handoff is not None and access_events:
+        from handoff import apply_clock_offset
+        note = apply_clock_offset(access_events, handoff)
+        if note:
+            print(f"    [etw] {note}")
+            analysis_notes.append(note)
+
+    # ST/DT can veto correlation outright when its own preconditions failed.
+    # Honour that rather than producing timing claims it has disowned.
+    if handoff is not None and not handoff.host_network_correlation_enabled:
+        reason = handoff.correlation_reason or "not stated"
+        note = (f"HOST<->NETWORK CORRELATION DISABLED BY SANDBOX: {reason}. "
+                f"Access events were ingested but not correlated; network-side "
+                f"findings stand on their own evidence.")
+        print(f"    [etw] {note}")
+        analysis_notes.append(note)
+        correlated = []
+    else:
+        if access_events:
+            sync = assess_clock_sync(access_events, net)
+            if sync.likely_skew:
+                print(f"    [etw] CLOCK SKEW: {sync.note}")
+        correlated = correlate(access_events, net, best_match=True)
+
     # --- handoff honesty-gates (correlation side): cap timing/telemetry claims ---
     if handoff is not None:
         from handoff import gate_correlated
         analysis_notes += gate_correlated(correlated, handoff)
+
+    # Independent static corroboration can promote strong -> confirmed, but only
+    # for findings not already capped by a caveat. Runs AFTER gating for exactly
+    # that reason.
+    if sample_meta is not None:
+        from sample_meta import promote_with_static_corroboration
+        analysis_notes += promote_with_static_corroboration(correlated, sample_meta)
     for c in correlated:
         print(f"    {c.data_type_accessed} ({c.mitre_technique_id}) -> {c.destination_ip} "
               f"({c.time_delta_s}s, {c.confidence_tier}, conf={c.correlation_confidence})")

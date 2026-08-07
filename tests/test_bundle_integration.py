@@ -1,0 +1,397 @@
+"""
+test_bundle_integration.py — the four ST/DT bundle integration gaps.
+
+Covers contract fields that were present in the WinST/DT handoff manifest but
+not consumed on this side:
+
+  1. correlation.access_events_path  — locate access events from the manifest
+  2. behavior/clock-sync.json        — APPLY the offset, not just detect skew
+  3. capabilities.dynamic.tls_interception — branch the encrypted-traffic path
+  4. sample.meta.json                — independent static corroboration
+
+Plus the correlation veto (host_network_correlation_enabled=false), which lets
+the sandbox disown timing claims its own preconditions could not support.
+"""
+import os
+import sys
+import json
+from datetime import datetime, timezone, timedelta
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
+
+import pytest
+from pipeline.handoff import (load_handoff, apply_clock_offset,
+                              correlation_window_slack_s, gate_network_events)
+from pipeline.sample_meta import (SampleMeta, ingest_sample_meta,
+                                  load_sample_meta, load_from_handoff,
+                                  promote_with_static_corroboration)
+
+
+# --------------------------------------------------------------------------
+# bundle builder
+# --------------------------------------------------------------------------
+
+def _manifest(**over):
+    m = {
+        "schema_version": "1.0",
+        "session_id": "11",
+        "status": "completed",
+        "errors": [],
+        "sample_sha256": "a" * 64,
+        "submitted_at_utc": "2026-08-05T10:13:00+00:00",
+        "detonation_start_utc": "2026-08-05T10:14:00+00:00",
+        "detonation_end_utc": "2026-08-05T10:19:00+00:00",
+        "guest_vm_identity": {"image_version": "v1", "vm_uuid": "u", "guest_ip": "10.66.0.101"},
+        "network_mode": "simulated_inetsim",
+        "static_risk_score": 7.5,
+        "static_hypotheses": ["packed", "suspicious_imports:CryptUnprotectData"],
+        "cape_task_id": 11,
+        "capemon_enabled": True,
+        "correlation": {
+            "access_events_path": "behavior/access_events.json",
+            "event_count": 3,
+            "clock_quality_acceptable": True,
+            "host_network_correlation_enabled": True,
+            "reason": None,
+        },
+        "telemetry": {"telemetry_degraded": False, "providers_unavailable": []},
+        "integrity": {"hash_manifest_sha256": "b" * 64},
+        "artifact_paths": {
+            "pcap": "network/capture.pcapng",
+            "trace_etl": "behavior/trace.etl",
+            "clock_sync": "behavior/clock-sync.json",
+            "access_events": "behavior/access_events.json",
+        },
+    }
+    m.update(over)
+    return m
+
+
+def _bundle(tmp_path, manifest=None, clock=None, sample_meta=None):
+    """Write a minimal on-disk handoff bundle; return the manifest path."""
+    (tmp_path / "behavior").mkdir(exist_ok=True)
+    (tmp_path / "network").mkdir(exist_ok=True)
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps(manifest or _manifest()))
+    (tmp_path / "behavior" / "access_events.json").write_text("[]")
+    if clock is not None:
+        (tmp_path / "behavior" / "clock-sync.json").write_text(json.dumps(clock))
+    if sample_meta is not None:
+        (tmp_path / "sample.meta.json").write_text(json.dumps(sample_meta))
+    return str(mpath)
+
+
+# --------------------------------------------------------------------------
+# 1. access_events_path resolution
+# --------------------------------------------------------------------------
+
+class TestAccessEventsPath:
+    def test_resolved_from_correlation_block(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert h.access_events_path == str(tmp_path / "behavior" / "access_events.json")
+        assert os.path.exists(h.access_events_path)
+        assert h.access_event_count == 3
+
+    def test_falls_back_to_contract_default_when_absent(self, tmp_path):
+        m = _manifest(correlation={"event_count": 0,
+                                   "clock_quality_acceptable": True,
+                                   "host_network_correlation_enabled": True,
+                                   "reason": None})
+        del m["artifact_paths"]["access_events"]
+        h = load_handoff(_bundle(tmp_path, manifest=m))
+        assert h.access_events_path.endswith(os.path.join("behavior", "access_events.json"))
+
+    def test_pcap_and_sample_meta_paths_resolved(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert h.pcap_path.endswith(os.path.join("network", "capture.pcapng"))
+        assert h.sample_meta_path.endswith("sample.meta.json")
+
+    def test_correlation_veto_is_honoured(self, tmp_path):
+        m = _manifest(correlation={
+            "access_events_path": "behavior/access_events.json",
+            "event_count": 3, "clock_quality_acceptable": False,
+            "host_network_correlation_enabled": False,
+            "reason": "clock offset exceeded tolerance"})
+        h = load_handoff(_bundle(tmp_path, manifest=m))
+        assert h.host_network_correlation_enabled is False
+        assert h.correlation_reason == "clock offset exceeded tolerance"
+
+    def test_missing_field_defaults_to_enabled(self, tmp_path):
+        m = _manifest(correlation={"event_count": 1,
+                                   "clock_quality_acceptable": True,
+                                   "reason": None})
+        h = load_handoff(_bundle(tmp_path, manifest=m))
+        assert h.host_network_correlation_enabled is True
+
+
+# --------------------------------------------------------------------------
+# 2. clock-sync.json — apply, don't just detect
+# --------------------------------------------------------------------------
+
+def _acc(ts):
+    return {"timestamp": ts, "data_type": "browser_credentials",
+            "api_call": "CryptUnprotectData", "process": "stealer.exe"}
+
+
+class TestClockOffset:
+    def test_flat_document_loaded(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={
+            "offset_ms": -420, "offset_uncertainty_ms": 50, "method": "midpoint"}))
+        assert h.clock_offset_ms == -420
+        assert h.clock_offset_uncertainty_ms == 50
+        assert h.clock_offset_source == "midpoint"
+        assert h.has_clock_offset
+
+    def test_nested_clock_key_also_loaded(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={
+            "clock": {"offset_ms": 1500, "offset_uncertainty_ms": 10}}))
+        assert h.clock_offset_ms == 1500
+
+    def test_absent_file_means_no_correction(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert h.clock_offset_ms == 0.0 and not h.has_clock_offset
+
+    def test_malformed_file_degrades_to_zero(self, tmp_path):
+        p = _bundle(tmp_path)
+        (tmp_path / "behavior" / "clock-sync.json").write_text("{not json")
+        h = load_handoff(p)
+        assert h.clock_offset_ms == 0.0
+
+    def test_offset_shifts_event_timestamps(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={
+            "offset_ms": 2000, "offset_uncertainty_ms": 25}))
+        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
+        events = [{"timestamp": base}]
+        note = apply_clock_offset(events, h)
+        assert events[0]["timestamp"] == base + timedelta(seconds=2)
+        assert "CLOCK OFFSET APPLIED" in note
+
+    def test_negative_offset_shifts_backwards(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={"offset_ms": -3000}))
+        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
+        events = [{"timestamp": base}]
+        apply_clock_offset(events, h)
+        assert events[0]["timestamp"] == base - timedelta(seconds=3)
+
+    def test_no_offset_leaves_timestamps_untouched(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        base = datetime(2026, 8, 5, 10, 14, 0, tzinfo=timezone.utc)
+        events = [{"timestamp": base}]
+        assert apply_clock_offset(events, h) is None
+        assert events[0]["timestamp"] == base
+
+    def test_uncertainty_widens_correlation_window(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={
+            "offset_ms": 0, "offset_uncertainty_ms": 2500}))
+        assert correlation_window_slack_s(h) == 2.5
+        assert correlation_window_slack_s(None) == 0.0
+
+    def test_string_timestamps_are_skipped_not_crashed(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, clock={"offset_ms": 1000}))
+        events = [{"timestamp": "2026-08-05T10:14:00+00:00"}]
+        assert apply_clock_offset(events, h) is None   # nothing parseable shifted
+
+
+# --------------------------------------------------------------------------
+# 3. tls_interception
+# --------------------------------------------------------------------------
+
+def _with_tls(status):
+    return _manifest(capabilities={"dynamic": {"tls_interception": {"status": status}}})
+
+
+class TestTlsInterception:
+    def test_pinning_suspected_detected(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, manifest=_with_tls("certificate_pinning_suspected")))
+        assert h.tls_pinning_suspected and not h.tls_plaintext_available
+
+    def test_intercepted_means_plaintext(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, manifest=_with_tls("intercepted")))
+        assert h.tls_plaintext_available and not h.tls_pinning_suspected
+
+    def test_no_tls_observed_is_neither(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, manifest=_with_tls("no_tls_observed")))
+        assert not h.tls_pinning_suspected and not h.tls_plaintext_available
+
+    def test_absent_capabilities_block_is_safe(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path))
+        assert h.tls_interception_status is None
+        assert not h.tls_pinning_suspected
+
+    def test_pinning_marks_events_plaintext_unavailable_and_notes(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, manifest=_with_tls("certificate_pinning_suspected")))
+        events = [{"kind": "beacon", "confidence_tier": "strong"}]
+        notes = gate_network_events(events, h)
+        assert events[0]["plaintext_available"] is False
+        assert any("TLS NOT INTERCEPTED" in n for n in notes)
+        assert any("metadata-only" in n for n in notes)
+
+    def test_interception_noted_as_plaintext_supported(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, manifest=_with_tls("intercepted")))
+        notes = gate_network_events([{"kind": "exfil"}], h)
+        assert any("TLS INTERCEPTED" in n for n in notes)
+
+
+# --------------------------------------------------------------------------
+# 4. sample.meta.json
+# --------------------------------------------------------------------------
+
+_META = {
+    "schema_version": "1.0",
+    "sample_sha256": "a" * 64,
+    "sample_md5": "b" * 32,
+    "sample_sha1": "c" * 40,
+    "file_type": "PE32 executable",
+    "static_risk_score": 8.0,
+    "static_hypotheses": ["packed", "suspicious_imports:CryptUnprotectData"],
+    "yara": {"fast_hits": ["generic_packer"], "deep_hits": ["RedLine_Stealer_config"]},
+    "clamav": {"status": "infected", "signature": "Win.Trojan.RedLine-9876543-0"},
+    "vt_lookup": "54/72",
+}
+
+
+class TestSampleMeta:
+    def test_fields_ingested(self):
+        m = ingest_sample_meta(_META)
+        assert m.ok
+        assert m.sample_sha256 == "a" * 64
+        assert m.static_risk_score == 8.0
+        assert m.yara_deep_hits == ["RedLine_Stealer_config"]
+        assert m.clamav_signature.startswith("Win.Trojan.RedLine")
+
+    def test_family_inferred_from_yara(self):
+        assert ingest_sample_meta(_META).family == "RedLine Stealer"
+
+    def test_family_none_when_unrecognised(self):
+        m = ingest_sample_meta({**_META, "yara": {"fast_hits": [], "deep_hits": []},
+                                "clamav": {"status": "clean", "signature": None}})
+        assert m.family is None
+
+    def test_corroborating_signals_collected(self):
+        sig = ingest_sample_meta(_META).corroborating_signals()
+        assert any("yara_deep" in s for s in sig)
+        assert any("clamav" in s for s in sig)
+        assert any("virustotal" in s for s in sig)
+
+    @pytest.mark.parametrize("vt,expected", [
+        ("54/72", True), ("0/72", False), ("not_configured", False),
+        ("unavailable", False), (None, False), ("", False),
+    ])
+    def test_vt_detection_parsing(self, vt, expected):
+        assert ingest_sample_meta({**_META, "vt_lookup": vt}).vt_detected is expected
+
+    def test_clean_sample_is_not_flagged(self):
+        m = ingest_sample_meta({**_META,
+                                "yara": {"fast_hits": [], "deep_hits": []},
+                                "clamav": {"status": "clean", "signature": None},
+                                "vt_lookup": "0/72"})
+        assert not m.independently_flagged
+
+    def test_risk_score_alone_is_not_corroboration(self):
+        """static_risk_score/hypotheses are heuristics from the same binary
+        inspection — treating them as independent would inflate tiers."""
+        m = ingest_sample_meta({**_META,
+                                "yara": {"fast_hits": [], "deep_hits": []},
+                                "clamav": {"status": "clean", "signature": None},
+                                "vt_lookup": "not_configured"})
+        assert m.static_risk_score == 8.0
+        assert m.static_hypotheses
+        assert not m.independently_flagged
+
+    def test_capability_techniques_mapped(self):
+        t = ingest_sample_meta(_META).capability_techniques()
+        assert "T1555.003" in t and "T1027.002" in t
+
+    def test_malformed_types_recorded_not_raised(self):
+        m = ingest_sample_meta({**_META, "yara": "nope", "static_hypotheses": "nope"})
+        assert not m.ok and len(m.errors) == 2
+
+    def test_missing_file_is_error_not_exception(self, tmp_path):
+        m = load_sample_meta(str(tmp_path / "nope.json"))
+        assert not m.ok and "file not found" in m.errors[0]
+
+    def test_loads_from_handoff_bundle(self, tmp_path):
+        h = load_handoff(_bundle(tmp_path, sample_meta=_META))
+        m = load_from_handoff(h)
+        assert m.ok and m.family == "RedLine Stealer"
+
+
+class TestArgParsing:
+    """Regression: a flag must never be bound as a positional path."""
+
+    def test_handoff_flag_not_read_as_access_events(self):
+        from pipeline.orchestrator import parse_args
+        a = parse_args(["x.pcap", "--handoff", "m.json"])
+        assert a["pcap"] == "x.pcap"
+        assert a["acc_path_explicit"] is None      # was "--handoff" before the fix
+        assert a["handoff_path"] == "m.json"
+
+    def test_explicit_access_events_still_positional(self):
+        from pipeline.orchestrator import parse_args
+        a = parse_args(["x.pcap", "acc.json", "--handoff", "m.json"])
+        assert a["acc_path_explicit"] == "acc.json"
+        assert a["handoff_path"] == "m.json"
+
+    def test_flag_values_not_treated_as_positionals(self):
+        from pipeline.orchestrator import parse_args
+        a = parse_args(["x.pcap", "--zeek-dir", "out/zeek",
+                        "--static-prior", "p.json", "--handoff", "m.json"])
+        assert a["pcap"] == "x.pcap"
+        assert a["acc_path_explicit"] is None
+        assert a["zeek_dir"] == "out/zeek"
+        assert a["static_prior_path"] == "p.json"
+
+    def test_defaults_when_no_args(self):
+        from pipeline.orchestrator import parse_args
+        a = parse_args([])
+        assert a["pcap"].endswith("sample_infostealer.pcap")
+        assert a["acc_path_explicit"] is None and a["handoff_path"] is None
+
+    def test_flags_before_positionals(self):
+        from pipeline.orchestrator import parse_args
+        a = parse_args(["--handoff", "m.json", "x.pcap"])
+        assert a["pcap"] == "x.pcap" and a["handoff_path"] == "m.json"
+
+
+class TestStaticPromotion:
+    def _ev(self, tier, **kw):
+        return {"confidence_tier": tier, "destination_ip": "198.51.100.44", **kw}
+
+    def test_strong_promoted_to_confirmed(self):
+        ev = [self._ev("strong")]
+        notes = promote_with_static_corroboration(ev, ingest_sample_meta(_META))
+        assert ev[0]["confidence_tier"] == "confirmed"
+        assert ev[0]["static_corroboration"]
+        assert any("promoted strong -> confirmed" in n for n in notes)
+
+    def test_weak_is_not_promoted(self):
+        """A weak finding is weak because its own behavioural evidence is thin.
+        An unrelated static hit does not repair that."""
+        ev = [self._ev("weak")]
+        promote_with_static_corroboration(ev, ingest_sample_meta(_META))
+        assert ev[0]["confidence_tier"] == "weak"
+
+    def test_capped_finding_is_not_promoted(self):
+        ev = [self._ev("strong", capped_by_caveat="clock_unreliable")]
+        promote_with_static_corroboration(ev, ingest_sample_meta(_META))
+        assert ev[0]["confidence_tier"] == "strong"
+
+    def test_confirmed_unchanged(self):
+        ev = [self._ev("confirmed")]
+        assert promote_with_static_corroboration(ev, ingest_sample_meta(_META)) == []
+        assert ev[0]["confidence_tier"] == "confirmed"
+
+    def test_clean_sample_promotes_nothing(self):
+        clean = ingest_sample_meta({**_META,
+                                    "yara": {"fast_hits": [], "deep_hits": []},
+                                    "clamav": {"status": "clean", "signature": None},
+                                    "vt_lookup": "0/72"})
+        ev = [self._ev("strong")]
+        assert promote_with_static_corroboration(ev, clean) == []
+        assert ev[0]["confidence_tier"] == "strong"
+
+    def test_none_meta_is_noop(self):
+        ev = [self._ev("strong")]
+        assert promote_with_static_corroboration(ev, None) == []
+        assert ev[0]["confidence_tier"] == "strong"

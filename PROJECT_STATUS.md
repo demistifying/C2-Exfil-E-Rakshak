@@ -6,7 +6,7 @@ in collaboration with the Windows ST/DT sandbox module, produces attributed,
 evidence-graded C2/exfiltration findings in a schema shared with the Android
 module.
 
-**Snapshot (Phases 1–4 core complete):** **191 tests passing.** Adds host↔network
+**Snapshot (Phases 1–4 core complete):** **325 tests passing.** Adds host↔network
 correlation hardening (best-match, clock-sync guarded) and **item-level exfil
 provenance** — "which stolen item left via what channel to which destination,
 when" — tested across every item type, every exfil protocol, negatives, window
@@ -124,16 +124,21 @@ external dependency (ETW host events) has a built, tested ingestion interface.
 
 ## 3. Testing — what is covered
 
-**79 tests, all passing**, by module:
+**325 tests, all passing** across 24 files. Highest-value groups:
 
 | Test file | Tests | Covers |
 |---|---:|---|
-| `test_traffic_analysis.py` | 26 | beaconing (regular/irregular/too-few), HTTP exfil, **FTP-STOR** (low-volume, APPE, per-server, negatives), private-IP filtering (**IPv4 + IPv6**) |
-| `test_etw_ingest.py` | 17 | schema validation, enum rejection, UTC enforcement, non-strict vs strict, clock-sync (aligned/skewed/before-only), ingestion→correlation handoff |
-| `test_correlation.py` | 11 | in-window match, out-of-window miss, negative-delta skip, 4-tier confidence assignment |
-| `test_pcap_loader.py` | 10 | scapy + Zeek loading, byte accounting, **native IPv6 + 6to4-tunnel inner-endpoint resolution** |
-| `test_attribution.py` | 9 | reputation hit/miss, **known-bad JA3 raise**, graceful degradation (missing DB/GeoLite2) |
-| `test_evidence_chain.py` | 6 | hash-chain integrity + tamper detection |
+| `test_bundle_integration.py` | 47 | ST/DT bundle consumption: access-events path resolution, clock-offset application, TLS-interception branch, `sample.meta.json` corroboration + promotion rules, correlation veto, CLI arg binding |
+| `test_traffic_analysis.py` | 37 | beaconing (regular/irregular/too-few), HTTP exfil, **FTP-STOR** (low-volume, APPE, per-server, negatives), private-IP filtering (**IPv4 + IPv6**) |
+| `test_provenance.py` | 33 | item-level exfil provenance across item types, protocols, window boundaries, negatives |
+| `test_handoff_integration.py` | 17 | manifest honesty gates, beaconing handshake guard, bundle filter, join/custody fields |
+| `test_etw_ingest.py` | 17 | schema validation, enum rejection, UTC enforcement, non-strict vs strict, clock-sync assessment, ingestion→correlation handoff |
+| `test_feeds_allowlist.py` | 14 | offline abuse.ch feed import, allowlist filtering |
+| `test_http_covert.py` | 13 | HTTP-gate and covert-channel detection |
+| `test_static_prior.py` | 12 | static IOC prior ingestion + static↔network correlation |
+| `test_correlation.py` | 11 | in-window match, out-of-window miss, negative-delta skip, 4-tier confidence |
+| `test_dns_analysis.py` + `test_dga_classifier.py` | 18 | DNS tunnelling/DoH detection, offline explainable DGA scoring |
+| *(14 further files)* | 106 | pcap/Zeek ingest, attribution, TLS/JA3/JA4, FTPS mitigation, family attribution, app-exfil, evidence chain, schema contract, timeline |
 
 **Live validation:** 5 real malware PCAPs with labeled ground truth —
 Redline (HTTP C2), Lumma (TLS C2 / JA3), Snake KeyLogger (FTP, 516 KB),
@@ -168,27 +173,51 @@ tuning, and real-world precision beyond the CIC slice needs more enterprise
 traffic.
 
 ### B. Detection coverage gaps — in our control, needs samples
-- **DNS tunneling / exfil** — the most common evasion path we don't yet detect
-  (no DNS analysis at all). Samples: dnscat2/iodine captures.
-- **FTPS / encrypted FTP** — both FTP samples were plaintext Pure-FTPd; if the
-  malware negotiates explicit TLS, `STOR` is encrypted and our detector is blind.
+- **DNS tunneling / exfil — ADDRESSED.** `dns_analysis.py` (tunnelling, DoH,
+  volumetric/entropy signals) plus an offline explainable DGA classifier
+  (`dga_classifier.py`, auditable JSON weights) are implemented and tested
+  against a dnscat2 capture. *Remaining:* iodine samples for a second tunnelling
+  implementation, and low-and-slow validation.
+- **FTPS / encrypted FTP — MITIGATED.** An encrypted `STOR` is invisible to the
+  payload detector, but the session is still caught by a known-bad JA3/JA4
+  fingerprint (`test_ftps_ja3_mitigation.py`). Not equivalent to plaintext
+  visibility; documented as partial.
 - **Low-and-slow beaconing** — long-interval C2 to stress jitter thresholds
-  (CTU-13 botnet captures).
+  (CTU-13 botnet captures). Still outstanding.
 
 ### C. Correlation hardening — in our control
-The logic works but is a first cut, to be hardened: it is temporal co-occurrence
-(not proven causation); it is many-to-many (every access×network pair in-window
-matches, which can spray low-tier events); and it depends on clock alignment
-(now checked). *How:* tune the 15 s window against labeled samples, and collapse
-to best-match-per-access.
+Hardened since first cut: correlation is now best-match-per-access (no longer
+many-to-many spraying low-tier events) and clock alignment is both *detected*
+and *corrected* using ST/DT's `behavior/clock-sync.json` offset. It remains
+temporal co-occurrence rather than proven causation, and it is capped
+accordingly under bad clock or degraded telemetry. *Remaining:* tune the 15 s
+window against labelled samples once real ETW data exists.
 
-### D. ETW real-data integration — BLOCKED (external dependency)
-Correlation runs on `data/access_events_fixture.json`. It cannot run on real
-data until the Windows ST/DT sandbox emits ETW host-access events. *Why not
-done:* not our code. *Status:* the ingestion interface, validator, and
-clock-skew check are built and tested, so this is a drop-in the moment the
-sandbox emits conforming output — and the teammate can self-check with the
-validator CLI now.
+### D. ETW real-data integration — INTERFACE COMPLETE, awaiting real events
+Correlation still runs on `data/access_events_fixture.json`. The consumption
+side is now fully wired to the ST/DT bundle contract:
+
+- access events are resolved from `manifest.correlation.access_events_path`
+  (no hand-passed path)
+- the guest→host clock offset from `behavior/clock-sync.json` is **applied**,
+  and its stated uncertainty widens the correlation window
+- `host_network_correlation_enabled = false` is honoured as a sandbox veto —
+  access events are ingested but no timing claims are made
+- `sample.meta.json` supplies independent binary-side corroboration
+- `capabilities.dynamic.tls_interception` selects the plaintext vs
+  metadata-only path
+
+*Why not done:* the sandbox has so far only detonated a benign validation
+payload, which produces no `browser_credentials` / `keystrokes` / `screenshot`
+events — so the classification path is structurally validated but not yet
+exercised on real behaviour. This is a drop-in the moment a real sample is
+detonated; the teammate can self-check with the validator CLI now.
+
+**Known contract gap:** `sample.meta.json` carries no network indicators
+(hashes, YARA, ClamAV, VT, hypotheses only), and the manifest has no field for
+the C2 configs the ST/DT config decryptors extract. Until ST/DT emits those —
+as a `c2_static_prior.json` artifact or an `iocs[]` array — `static_prior.py`
+has no bundle-native source and must be fed a prior file explicitly.
 
 ### E. Operational / minor
 - **Docker + Postgres end-to-end** — documented but not run clean top-to-bottom.

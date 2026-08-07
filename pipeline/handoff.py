@@ -26,6 +26,7 @@ Everything degrades gracefully: no manifest -> legacy behavior, no gating.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 import json
 import os
 
@@ -82,9 +83,47 @@ class Handoff:
     path: str | None = None
     raw: dict = field(default_factory=dict)
 
+    # --- bundle-resolved artifact paths + the ST/DT correlation gate ---------
+    # manifest.correlation tells us where the access events are, how many to
+    # expect, and whether ST/DT considers host<->network correlation safe to
+    # run at all. Previously we required the caller to pass the path by hand.
+    bundle_dir: str | None = None
+    access_events_path: str | None = None
+    access_event_count: int | None = None
+    host_network_correlation_enabled: bool = True
+    correlation_reason: str | None = None
+    sample_meta_path: str | None = None
+    pcap_path: str | None = None
+
+    # --- clock correction (behavior/clock-sync.json) -------------------------
+    # ST/DT computes the guest->host offset; we used to only DETECT skew and
+    # then re-derive it ourselves. Now we apply what it hands us.
+    clock_offset_ms: float = 0.0
+    clock_offset_uncertainty_ms: float = 0.0
+    clock_offset_source: str | None = None
+
+    # --- encrypted-traffic branch (capabilities.dynamic.tls_interception) ----
+    tls_interception_status: str | None = None
+
     @property
     def simulated(self) -> bool:
         return self.network_mode == "simulated_inetsim"
+
+    @property
+    def tls_pinning_suspected(self) -> bool:
+        """TLS could not be read: fall back to metadata-only signals (JA3/JA4,
+        SNI, cadence, ASN) rather than treating the traffic as un-analysable."""
+        return self.tls_interception_status in {
+            "certificate_pinning_suspected", "certificate_rejected",
+            "unsupported_protocol", "proxy_error"}
+
+    @property
+    def tls_plaintext_available(self) -> bool:
+        return self.tls_interception_status == "intercepted"
+
+    @property
+    def has_clock_offset(self) -> bool:
+        return bool(self.clock_offset_ms) or bool(self.clock_offset_uncertainty_ms)
 
 
 def load_handoff(path: str, *, strict: bool = False) -> Handoff:
@@ -110,8 +149,23 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
     tel = raw.get("telemetry") or {}
     ident = raw.get("guest_vm_identity") or {}
     integ = raw.get("integrity") or {}
+    apaths = raw.get("artifact_paths") or {}
     providers = [p.get("provider") for p in (tel.get("providers_unavailable") or [])
                  if isinstance(p, dict) and p.get("provider")]
+
+    bundle_dir = os.path.dirname(os.path.abspath(path))
+
+    def _resolve(rel):
+        return os.path.join(bundle_dir, rel) if rel else None
+
+    # correlation.access_events_path is the authoritative location; fall back to
+    # artifact_paths.access_events, then to the contract's fixed default.
+    acc_rel = (corr.get("access_events_path")
+               or apaths.get("access_events")
+               or "behavior/access_events.json")
+
+    offset_ms, unc_ms, off_src = _load_clock_sync(
+        _resolve(apaths.get("clock_sync") or "behavior/clock-sync.json"))
 
     return Handoff(
         schema_version=sv,
@@ -130,7 +184,103 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
         hash_manifest_sha256=integ.get("hash_manifest_sha256"),
         path=path,
         raw=raw,
+        bundle_dir=bundle_dir,
+        access_events_path=_resolve(acc_rel),
+        access_event_count=corr.get("event_count"),
+        # Absent field -> assume ENABLED (legacy bundles predate the gate), but
+        # an explicit False must be honoured: ST/DT is telling us its own
+        # correlation preconditions were not met.
+        host_network_correlation_enabled=bool(
+            corr.get("host_network_correlation_enabled", True)),
+        correlation_reason=corr.get("reason"),
+        sample_meta_path=_resolve("sample.meta.json"),
+        pcap_path=_resolve(apaths.get("pcap") or "network/capture.pcapng"),
+        clock_offset_ms=offset_ms,
+        clock_offset_uncertainty_ms=unc_ms,
+        clock_offset_source=off_src,
+        tls_interception_status=_tls_status(raw),
     )
+
+
+def _load_clock_sync(path: str | None) -> tuple[float, float, str | None]:
+    """Read ST/DT's computed guest->host clock offset.
+
+    Accepts either a flat {offset_ms, offset_uncertainty_ms} document or one
+    nested under a "clock" key, since the ST/DT side has used both shapes.
+    Missing/unparseable -> (0, 0, None), i.e. no correction, which is the same
+    behaviour as before this was wired.
+    """
+    if not path or not os.path.exists(path):
+        return 0.0, 0.0, None
+    try:
+        doc = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return 0.0, 0.0, None
+    if isinstance(doc.get("clock"), dict):
+        doc = doc["clock"]
+    try:
+        off = float(doc.get("offset_ms", 0) or 0)
+    except (TypeError, ValueError):
+        off = 0.0
+    try:
+        unc = abs(float(doc.get("offset_uncertainty_ms", 0) or 0))
+    except (TypeError, ValueError):
+        unc = 0.0
+    return off, unc, doc.get("method") or "clock-sync.json"
+
+
+def _tls_status(raw: dict) -> str | None:
+    caps = raw.get("capabilities")
+    if not isinstance(caps, dict):
+        return None
+    dyn = caps.get("dynamic")
+    if not isinstance(dyn, dict):
+        return None
+    tls = dyn.get("tls_interception")
+    if not isinstance(tls, dict):
+        return None
+    return tls.get("status")
+
+
+def apply_clock_offset(events: list, h: Handoff | None) -> str | None:
+    """Shift host access-event timestamps onto the network capture's clock.
+
+    ST/DT timestamps access events on the GUEST clock; the PCAP is timestamped
+    on the HOST tap. Correlation compares the two, so an uncorrected offset
+    silently produces false negatives (or, worse, false positives at the window
+    edge). `offset_ms` is the correction to ADD to a guest timestamp to express
+    it on the host clock.
+
+    Mutates events in place. Returns a human-readable note, or None if there was
+    nothing to apply.
+    """
+    if h is None or not h.has_clock_offset or not events:
+        return None
+    delta = timedelta(milliseconds=h.clock_offset_ms)
+    shifted = 0
+    for e in events:
+        ts = e.get("timestamp") if isinstance(e, dict) else getattr(e, "timestamp", None)
+        if not isinstance(ts, datetime):
+            continue
+        if isinstance(e, dict):
+            e["timestamp"] = ts + delta
+        else:
+            setattr(e, "timestamp", ts + delta)
+        shifted += 1
+    if not shifted:
+        return None
+    return (f"CLOCK OFFSET APPLIED: {h.clock_offset_ms:+.0f} ms "
+            f"(±{h.clock_offset_uncertainty_ms:.0f} ms, source: "
+            f"{h.clock_offset_source}) to {shifted} host access event(s) to "
+            f"align the guest clock with the PCAP capture clock.")
+
+
+def correlation_window_slack_s(h: Handoff | None) -> float:
+    """Extra seconds to widen the correlation window by, so a stated clock
+    uncertainty is accounted for rather than silently ignored."""
+    if h is None:
+        return 0.0
+    return h.clock_offset_uncertainty_ms / 1000.0
 
 
 def _jsonschema_validate(raw: dict, *, strict: bool) -> None:
@@ -232,6 +382,27 @@ def gate_network_events(events: list, h: Handoff | None) -> list[str]:
             f"CLOCK QUALITY NOT ACCEPTABLE: host/network clocks not reliably "
             f"aligned — timing-based findings capped to weak ({capped} affected). "
             f"Reputation/static confirmations are unaffected.")
+
+    # Encrypted-traffic branch. Pinning is NOT a dead end — it just means the
+    # payload is unavailable and we rely on metadata-only signals. Say which
+    # path we took so a reader knows whether "no exfil content" means "none"
+    # or "we could not look".
+    if h.tls_pinning_suspected:
+        for e in events:
+            if isinstance(e, dict):
+                e.setdefault("plaintext_available", False)
+            elif getattr(e, "plaintext_available", None) is None:
+                setattr(e, "plaintext_available", False)
+        notes.append(
+            f"TLS NOT INTERCEPTED ({h.tls_interception_status}): encrypted "
+            f"payloads were not readable for this run. Detection falls back to "
+            f"metadata-only signals (JA3/JA4, SNI, certificate, cadence, "
+            f"ASN/geo). Absence of observed exfil CONTENT is not evidence that "
+            f"none occurred.")
+    elif h.tls_plaintext_available:
+        notes.append(
+            "TLS INTERCEPTED: decrypted payloads were available to ST/DT for "
+            "this run; content-based exfil findings are supported by plaintext.")
     return notes
 
 
