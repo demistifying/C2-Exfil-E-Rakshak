@@ -30,8 +30,12 @@ def load(events_path="output/exfil_events.json"):
         print("[!] No rows to load."); return
     sample_id = rows[0]["sample_id"]
     # Overall sample tier = highest tier present.
-    order = {"confirmed": 3, "strong": 2, "weak": 1, "unconfirmed": 0}
-    tier = max((r["confidence_tier"] for r in rows), key=lambda t: order.get(t, 0))
+    # allowlisted ranks BELOW unconfirmed: a finding deliberately judged
+    # benign must never become the sample-level verdict over a real one.
+    order = {"confirmed": 3, "strong": 2, "weak": 1, "unconfirmed": 0,
+             "allowlisted": -1}
+    _DEF = -1
+    tier = max((r["confidence_tier"] for r in rows), key=lambda t: order.get(t, _DEF))
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -49,7 +53,9 @@ def load(events_path="output/exfil_events.json"):
                     reputation_score, reputation_note, reputation_source,
                     ja3_hash, plaintext_available,
                     confidence_score, confidence_tier,
-                    mitre_technique_id, manifest_sha256, evidence_hash)
+                    mitre_technique_id, manifest_sha256, evidence_hash,
+                    case_id, finding_kind, plain_language, capped_by_caveat,
+                    evidence_refs)
                    VALUES (%(event_id)s, %(sample_id)s, %(session_id)s, %(cape_task_id)s,
                     %(platform)s, %(timestamp)s,
                     %(data_type_accessed)s, %(access_api_call)s,
@@ -58,7 +64,9 @@ def load(events_path="output/exfil_events.json"):
                     %(reputation_score)s, %(reputation_note)s, %(reputation_source)s,
                     %(ja3_hash)s, %(plaintext_available)s,
                     %(confidence_score)s, %(confidence_tier)s,
-                    %(mitre_technique_id)s, %(manifest_sha256)s, %(evidence_hash)s)
+                    %(mitre_technique_id)s, %(manifest_sha256)s, %(evidence_hash)s,
+                    %(case_id)s, %(finding_kind)s, %(plain_language)s,
+                    %(capped_by_caveat)s, %(evidence_refs)s::jsonb)
                    ON CONFLICT (event_id) DO NOTHING""",
                 {k: r.get(k) for k in (
                     "event_id", "sample_id", "session_id", "cape_task_id",
@@ -69,7 +77,10 @@ def load(events_path="output/exfil_events.json"):
                     "reputation_score", "reputation_note", "reputation_source",
                     "ja3_hash", "plaintext_available",
                     "confidence_score", "confidence_tier",
-                    "mitre_technique_id", "manifest_sha256", "evidence_hash")})
+                    "mitre_technique_id", "manifest_sha256", "evidence_hash",
+                    "case_id", "finding_kind", "plain_language",
+                    "capped_by_caveat")}
+                | {"evidence_refs": json.dumps(r.get("evidence_refs") or [])})
         conn.commit()
     print(f"[*] Loaded sample {sample_id[:16]}... ({tier}) with {len(rows)} events")
 

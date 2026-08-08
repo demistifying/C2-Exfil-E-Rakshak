@@ -14,7 +14,10 @@ CREATE TABLE IF NOT EXISTS static_iocs (
   ioc_type          TEXT,                      -- domain|ip|url|port
   value             TEXT,
   confidence_weight REAL,
-  source            TEXT
+  source            TEXT,                      -- family_decryptor|mobsf_manifest|yara
+  case_id           UUID,                      -- per-run case (unified tool)
+  first_seen_at     TIMESTAMPTZ,
+  seen_in_traffic   BOOLEAN DEFAULT FALSE      -- static IOC also observed on the wire
 );
 
 CREATE TABLE IF NOT EXISTS exfil_events (
@@ -41,7 +44,18 @@ CREATE TABLE IF NOT EXISTS exfil_events (
   confidence_tier     TEXT,
   mitre_technique_id  TEXT,
   manifest_sha256     TEXT,                    -- ST/DT bundle hash (custody-chain link; first row)
-  evidence_hash       TEXT                     -- sha256 chained to prior row (seeded from manifest_sha256)
+  evidence_hash       TEXT,                    -- sha256 chained to prior row (seeded from manifest_sha256)
+  -- --- unified-tool integration (schema 1.3) --------------------------------
+  -- These live HERE, not in contract/schema_v2.sql, because
+  -- tests/test_schema_contract.py parses this file to keep emit_schema_rows(),
+  -- db_loader's INSERT and the CSV export in lockstep. A column defined
+  -- elsewhere is invisible to that guard — which is exactly the silent-drop
+  -- bug the guard exists to prevent.
+  case_id             UUID,                    -- per-run case for the unified tool, NULL standalone
+  finding_kind        TEXT,                    -- beacon|exfil|correlation|reputation|covert_channel|dns|static_ioc
+  plain_language      TEXT,                    -- officer-facing one-liner
+  capped_by_caveat    TEXT,                    -- caveat code that limited this tier, if any
+  evidence_refs       JSONB DEFAULT '[]'::jsonb -- pointers to raw evidence (zeek uid, pkt window, access seq)
 );
 
 CREATE TABLE IF NOT EXISTS evidence_log (
@@ -49,8 +63,27 @@ CREATE TABLE IF NOT EXISTS evidence_log (
   sample_id     TEXT REFERENCES samples(sample_id),
   event_ref     TEXT,
   evidence_hash TEXT NOT NULL,
-  timestamp     TIMESTAMPTZ NOT NULL DEFAULT now()
+  timestamp     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  case_id       UUID                           -- per-run case (unified tool)
 );
 
 CREATE INDEX IF NOT EXISTS idx_exfil_sample ON exfil_events(sample_id);
 CREATE INDEX IF NOT EXISTS idx_exfil_dstip  ON exfil_events(destination_ip);
+
+-- ---------------------------------------------------------------------------
+-- Idempotent upgrades for databases created before schema 1.3. CREATE TABLE
+-- IF NOT EXISTS above is a no-op on an existing DB, so the same columns are
+-- restated here as ALTERs. Safe to re-run.
+-- ---------------------------------------------------------------------------
+ALTER TABLE exfil_events ADD COLUMN IF NOT EXISTS case_id          UUID;
+ALTER TABLE exfil_events ADD COLUMN IF NOT EXISTS finding_kind     TEXT;
+ALTER TABLE exfil_events ADD COLUMN IF NOT EXISTS plain_language   TEXT;
+ALTER TABLE exfil_events ADD COLUMN IF NOT EXISTS capped_by_caveat TEXT;
+ALTER TABLE exfil_events ADD COLUMN IF NOT EXISTS evidence_refs    JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE static_iocs  ADD COLUMN IF NOT EXISTS case_id          UUID;
+ALTER TABLE static_iocs  ADD COLUMN IF NOT EXISTS first_seen_at    TIMESTAMPTZ;
+ALTER TABLE static_iocs  ADD COLUMN IF NOT EXISTS seen_in_traffic  BOOLEAN DEFAULT FALSE;
+ALTER TABLE evidence_log ADD COLUMN IF NOT EXISTS case_id          UUID;
+
+CREATE INDEX IF NOT EXISTS idx_exfil_case  ON exfil_events(case_id);
+CREATE INDEX IF NOT EXISTS idx_static_case ON static_iocs(case_id);
