@@ -69,3 +69,7 @@ MEETING_BRIEF.md
 *.swp
 *.swo
 *~
+
+# Superseded local copies. The integration contract is owned by UMAT
+# (MYTH-il/E-Rakshak-UMAT, contracts/) — see docs/umat_integration.md.
+contract.DELETED-*/

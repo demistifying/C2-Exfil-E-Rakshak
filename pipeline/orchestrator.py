@@ -492,13 +492,139 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     return events
 
 
-def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
+# --- schema 1.3 integration fields ------------------------------------------
+# UMAT's contracts/c2/c2-event-v1.3.schema.json REQUIRES case_id, finding_kind,
+# plain_language and evidence_refs on every row, with additionalProperties=false.
+# Our native `kind` vocabulary is finer-grained than their finding_kind enum, so
+# it is folded down here. Their enum has no "unclassified" bucket; residual
+# egress therefore maps to `exfil` (traffic did leave the host) and the honesty
+# is carried by the tier and the plain-language text, not by overstating the
+# kind. Raised with them as a suggested enum addition.
+_FINDING_KIND = {
+    "beacon": "beacon",
+    "exfil": "exfil",
+    "smtp_exfil": "exfil",
+    "unclassified_egress": "exfil",
+    "static_ioc": "static_ioc",
+    "dga": "dns",
+    "dga_ml": "dns",
+    "dns_tunnel": "dns",
+    "icmp_tunnel": "covert_channel",
+    "port_mismatch": "covert_channel",
+    "tls_cert": "reputation",
+}
+_VALID_FINDING_KINDS = {"beacon", "exfil", "correlation", "reputation",
+                        "covert_channel", "dns", "static_ioc"}
+
+
+def _finding_kind(native_kind: str | None, reputation_hit: bool = False) -> str:
+    """Fold a native detector kind onto UMAT's finding_kind enum."""
+    mapped = _FINDING_KIND.get(native_kind or "")
+    if mapped:
+        return mapped
+    # Unknown detector: a reputation hit is the honest label, otherwise it is
+    # simply observed egress. Never invent a category outside their enum.
+    return "reputation" if reputation_hit else "exfil"
+
+
+def _dest_label(row: dict) -> str:
+    d = row.get("destination_domain")
+    ip = row.get("destination_ip")
+    port = row.get("destination_port")
+    if d and ip:
+        return f"{d} ({ip})"
+    if d:
+        return d
+    return f"{ip}:{port}" if ip and port else (ip or "an unidentified destination")
+
+
+def _plain_language(row: dict, native_kind: str | None, correlated_ctx=None) -> str:
+    """One officer-readable sentence. Required, non-empty, no jargon.
+
+    States what was observed and — where the tier is not `confirmed` — that it
+    is not asserted, so the sentence can never read as stronger than the tier.
+    """
+    dest = _dest_label(row)
+    tier = row.get("confidence_tier")
+    geo = row.get("geo_country")
+    where = f" in {geo}" if geo else ""
+
+    if correlated_ctx is not None:
+        what = (correlated_ctx.data_type_accessed or "data").replace("_", " ")
+        delta = getattr(correlated_ctx, "time_delta_s", None)
+        when = f" {delta:g} seconds later" if isinstance(delta, (int, float)) else ""
+        base = (f"This sample read {what} on the computer and contacted "
+                f"{dest}{where}{when}.")
+    elif native_kind == "static_ioc":
+        base = (f"{dest} was found written inside the file itself as a "
+                f"contact address.")
+    elif native_kind == "beacon":
+        base = (f"This sample contacted {dest}{where} repeatedly at regular "
+                f"intervals, a pattern typical of remote-control software.")
+    elif native_kind in ("dga", "dga_ml", "dns_tunnel"):
+        base = (f"This sample used the domain-name system to reach {dest} in a "
+                f"way normal software does not.")
+    elif native_kind in ("icmp_tunnel", "port_mismatch"):
+        base = (f"This sample sent data to {dest}{where} over an unusual "
+                f"channel, which can be used to avoid monitoring.")
+    elif native_kind in ("exfil", "smtp_exfil"):
+        base = f"This sample uploaded data from the computer to {dest}{where}."
+    elif native_kind == "tls_cert":
+        base = (f"Encrypted traffic to {dest}{where} matched a fingerprint "
+                f"associated with known malicious software.")
+    else:
+        base = f"This sample sent data out to {dest}{where}."
+
+    note = row.get("reputation_note")
+    if row.get("reputation_score") and note:
+        base += f" That destination is on a threat-intelligence list ({note})."
+    if tier == "allowlisted":
+        base += " Reviewed and assessed as normal activity, not a threat."
+    elif tier in ("weak", "unconfirmed"):
+        base += " This is shown for review and is not confirmed."
+    return base
+
+
+def _evidence_refs(native_kind: str | None, row: dict, correlated_ctx=None) -> list:
+    """Pointers back to the raw evidence behind this row, for L3 drill-down."""
+    refs: list = [{
+        "type": "network_event",
+        "detector": native_kind or "unknown",
+        "destination_ip": row.get("destination_ip"),
+        "destination_port": row.get("destination_port"),
+        "destination_domain": row.get("destination_domain"),
+        "timestamp": row.get("timestamp"),
+    }]
+    if row.get("ja3_hash"):
+        refs.append({"type": "tls_fingerprint", "ja3": row["ja3_hash"]})
+    if row.get("reputation_source"):
+        refs.append({"type": "threat_intel",
+                     "source": row["reputation_source"],
+                     "note": row.get("reputation_note")})
+    if correlated_ctx is not None:
+        refs.append({
+            "type": "host_access",
+            "data_type": correlated_ctx.data_type_accessed,
+            "api_call": correlated_ctx.access_api_call,
+            "time_delta_s": getattr(correlated_ctx, "time_delta_s", None),
+        })
+    return refs
+
+
+def emit_schema_rows(network_events, correlated, sample_id, handoff=None,
+                     case_id=None):
     """Stage 4: fold everything into exfil_events rows with a hash chain.
 
     Populates all shared-schema columns. When a handoff manifest is supplied,
     rows carry the per-run join keys (session_id / cape_task_id) and the evidence
     hash chain is SEEDED with the bundle's integrity.hash_manifest_sha256 so our
     custody chain links to ST/DT's — the first row also records the seed value.
+
+    `case_id` is UMAT's analysis_run_id and is supplied by the caller; it stays
+    None for standalone runs, where the SQL column is nullable. All four schema
+    1.3 integration fields (case_id, finding_kind, plain_language,
+    evidence_refs) are set BEFORE the row is hashed, so they are covered by the
+    evidence chain rather than appended outside it.
     """
     session_id = getattr(handoff, "session_id", None) if handoff else None
     cape_task_id = getattr(handoff, "cape_task_id", None) if handoff else None
@@ -538,6 +664,13 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
             # Prefer the technique resolved at ingestion; fall back to local map.
             "mitre_technique_id": c.mitre_technique_id or MITRE.get(c.data_type_accessed),
         }
+        # --- schema 1.3 integration fields (inside the hash) ---------------
+        row["case_id"] = case_id
+        row["finding_kind"] = "correlation"
+        row["capped_by_caveat"] = getattr(c, "capped_by_caveat", None)
+        row["plain_language"] = _plain_language(row, "correlation", correlated_ctx=c)
+        row["evidence_refs"] = _evidence_refs(
+            net_match.get("kind") if net_match else None, row, correlated_ctx=c)
         if not rows and seed != "0" * 64:
             row["manifest_sha256"] = seed   # link to ST/DT custody chain
         prev = hashlib.sha256((prev + json.dumps(row, sort_keys=True)).encode()).hexdigest()
@@ -570,6 +703,12 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
                                      "confirmed" if e["reputation_hit"] else "weak"),
             "mitre_technique_id": MITRE.get(e["kind"]),
         }
+        # --- schema 1.3 integration fields (inside the hash) ---------------
+        row["case_id"] = case_id
+        row["finding_kind"] = _finding_kind(e.get("kind"), bool(e.get("reputation_hit")))
+        row["capped_by_caveat"] = e.get("capped_by_caveat")
+        row["plain_language"] = _plain_language(row, e.get("kind"))
+        row["evidence_refs"] = _evidence_refs(e.get("kind"), row)
         if not rows and seed != "0" * 64:
             row["manifest_sha256"] = seed   # link to ST/DT custody chain
         prev = hashlib.sha256((prev + json.dumps(row, sort_keys=True)).encode()).hexdigest()
@@ -578,7 +717,7 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None):
     return rows
 
 
-_VALUE_FLAGS = ("--zeek-dir", "--static-prior", "--handoff")
+_VALUE_FLAGS = ("--zeek-dir", "--static-prior", "--handoff", "--case-id")
 
 
 def parse_args(argv: list[str]) -> dict:
@@ -590,9 +729,10 @@ def parse_args(argv: list[str]) -> dict:
     literal string "--handoff", which failed os.path.exists() and disabled
     correlation with no explanation.
     """
-    flags: dict = {"zeek_dir": None, "static_prior_path": None, "handoff_path": None}
+    flags: dict = {"zeek_dir": None, "static_prior_path": None,
+                   "handoff_path": None, "case_id": None}
     key_for = {"--zeek-dir": "zeek_dir", "--static-prior": "static_prior_path",
-               "--handoff": "handoff_path"}
+               "--handoff": "handoff_path", "--case-id": "case_id"}
     consumed: set[int] = set()
     for i, a in enumerate(argv):
         if a in _VALUE_FLAGS and i + 1 < len(argv):
@@ -617,6 +757,7 @@ def main():
     zeek_dir = args["zeek_dir"]
     static_prior_path = args["static_prior_path"]
     handoff_path = args["handoff_path"]
+    case_id = args["case_id"]   # UMAT analysis_run_id; None for standalone runs
 
     handoff = None
     sample_meta = None
@@ -764,7 +905,8 @@ def main():
                        "cape_task_id": getattr(handoff, "cape_task_id", None)}, f, indent=2)
 
     print("\n[*] Stage 4: emit shared exfil_events schema (hash-chained)")
-    rows = emit_schema_rows(net, correlated, sample_id, handoff=handoff)
+    rows = emit_schema_rows(net, correlated, sample_id, handoff=handoff,
+                            case_id=case_id)
     with open("output/exfil_events.json", "w") as f:
         json.dump(rows, f, indent=2)
     print(f"    Wrote {len(rows)} rows to output/exfil_events.json")

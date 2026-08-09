@@ -182,6 +182,18 @@ To add more samples:
   pinning), JA3/JA3S fingerprints + beaconing intervals + destination ASN/geo
   still produce useful attribution without payload content.
 
+## Integration (UMAT)
+
+This module runs as one of four components under the UMAT control plane
+(<https://github.com/MYTH-il/E-Rakshak-UMAT>), which owns the case model, the
+shared vocabularies, and the schema our output is validated against. Under UMAT:
+
+```bash
+python pipeline/orchestrator.py <pcap> --handoff <bundle>/manifest.json --case-id <analysis_run_id>
+```
+
+See **`docs/umat_integration.md`** — the contract is deliberately not duplicated here.
+
 ## Cross-module interfaces
 
 - **In (from Windows ST/DT):** shared PCAP path + host access events (ETW),
