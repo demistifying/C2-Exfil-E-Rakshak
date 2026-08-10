@@ -17,6 +17,8 @@ import re
 import sys
 import json
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
 
@@ -30,6 +32,23 @@ REDLINE = os.path.join(
     ROOT, "data",
     "2024-10-23-Redline-Stealer-infection-traffic.pcap",
     "2024-10-23-Redline-Stealer-infection-traffic.pcap")
+
+# Captures are deliberately not committed (.gitignore: *.pcap) — they are large
+# and may carry PII. The corpus-dependent tests below therefore SKIP on a clean
+# clone rather than fail, matching how every other corpus test in this suite
+# behaves (test_pcap_loader, test_tls_analysis, test_zeek_ingest, ...).
+#
+# They used to fail hard, which meant integrators had to deselect them by name:
+# WinST/DT records exactly that in docs/current_stack.md ("3 explicitly
+# deselected tests depend on an upstream-ignored PCAP"). A red suite on a fresh
+# clone is indistinguishable from a real regression, so it hid signal.
+requires_corpus = pytest.mark.skipif(
+    not os.path.exists(REDLINE),
+    reason=("Redline corpus capture not present at data/"
+            "2024-10-23-Redline-Stealer-infection-traffic.pcap/ — see "
+            "data/README.md for how to obtain it. Attribution contract "
+            "coverage is skipped, not failed."),
+)
 
 # Fields intentionally not persisted to the shared schema (internal-only).
 # Keep this explicit so anything NEW that falls out is caught, not assumed OK.
@@ -64,10 +83,7 @@ def _rows():
     return emit_schema_rows(net, [], sample_id="contract-test")
 
 
-def test_sample_present():
-    assert os.path.exists(REDLINE), "Redline sample missing — contract test needs it"
-
-
+@requires_corpus
 def test_rows_have_attribution_populated():
     """Regression guard for the exact bug: the note must reach the rows."""
     rows = _rows()
@@ -80,9 +96,14 @@ def test_rows_have_attribution_populated():
     assert r["confidence_tier"] == "confirmed"
 
 
+@requires_corpus
 def test_every_row_key_is_a_schema_column():
     schema = _schema_columns()
     rows = _rows()
+    # Without this guard the test passes vacuously when the corpus is absent:
+    # set().union(*()) is set(), so `dropped` is empty and nothing is checked.
+    # That is worse than failing — it reports green while testing nothing.
+    assert rows, "no rows emitted — the drift check below would pass vacuously"
     keys = set().union(*(set(r) for r in rows))
     dropped = keys - schema - INTERNAL_ONLY
     assert not dropped, f"row keys not in schema (silently dropped on DB write): {dropped}"
@@ -101,6 +122,7 @@ def test_loader_columns_all_exist_in_schema():
         "db_loader inserts a column that isn't in schema.sql"
 
 
+@requires_corpus
 def test_attribution_reaches_csv_export(tmp_path):
     rows = _rows()
     out = str(tmp_path / "iocs.csv")

@@ -85,6 +85,13 @@ def import_feodo(csv_path: str, db_path: str = _REP_DB) -> int:
             malware = parts[5].strip().strip('"')
             first_seen = parts[0].strip().strip('"')
 
+            # An uncommented header row would otherwise be stored as an
+            # indicator literally named "dst_ip". Validating the value is an
+            # address covers that and any other malformed line, without
+            # depending on the header being marked with '#'.
+            if not _is_ip_literal(ip):
+                continue
+
             note = f"{malware} C2 (port {port})"
             conn.execute(
                 "INSERT OR REPLACE INTO bad_indicators "
@@ -98,11 +105,39 @@ def import_feodo(csv_path: str, db_path: str = _REP_DB) -> int:
     return count
 
 
+# abuse.ch's own hosts appear in the URLhaus feed because every row carries a
+# urlhaus_link back to the site. Importing them would flag the intelligence
+# provider itself as a C2 — a false positive an officer would immediately, and
+# rightly, distrust.
+_FEED_SELF_REFERENCE = ("abuse.ch",)
+
+
+def _is_ip_literal(host: str) -> bool:
+    """True when a URL host is a bare address rather than a name.
+
+    URLhaus lists URLs, so roughly seven in eight of its hosts are raw IPs.
+    Storing those as indicator_type='domain' means an IP lookup can never match
+    them and the whole feed contributes nothing to reputation scoring.
+    """
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def import_urlhaus(csv_path: str, db_path: str = _REP_DB) -> int:
     """Import URLhaus URL dump.
 
     Format: CSV with columns:
       # id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,...
+
+    URLhaus is a URL feed, not an indicator feed, so three normalisations are
+    applied here rather than being left to whoever prepares the snapshot. They
+    used to be manual post-import cleaning steps recorded only in
+    data/feeds/README.md, which meant a fresh clone running `refresh` rebuilt a
+    subtly wrong database while believing it had reproduced the shipped one.
     """
     if not os.path.exists(csv_path):
         print(f"[!] File not found: {csv_path}")
@@ -111,6 +146,8 @@ def import_urlhaus(csv_path: str, db_path: str = _REP_DB) -> int:
     conn = sqlite3.connect(db_path)
     _ensure_schema(conn)
     count = 0
+
+    from urllib.parse import urlparse
 
     with open(csv_path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -125,17 +162,31 @@ def import_urlhaus(csv_path: str, db_path: str = _REP_DB) -> int:
             dateadded = parts[1].strip().strip('"')
             tags = parts[6].strip().strip('"')
 
+            # (1) The converted feed keeps a bare header row. Left alone it is
+            #     stored as an indicator literally named "url", which then
+            #     matches nothing and inflates the indicator count.
+            if parts[0].strip().strip('"').lower() in ("id", "#id") or url.lower() == "url":
+                continue
+
             # Extract domain/IP from URL for lookup compatibility
-            from urllib.parse import urlparse
             parsed = urlparse(url)
-            host = parsed.hostname or url
+            host = (parsed.hostname or url).strip().rstrip(".").lower()
+            if not host:
+                continue
+
+            # (2) Never flag the feed provider itself.
+            if any(host == d or host.endswith("." + d) for d in _FEED_SELF_REFERENCE):
+                continue
+
+            # (3) Type the indicator by what it actually is, so IP lookups hit.
+            indicator_type = "ip" if _is_ip_literal(host) else "domain"
 
             note = f"{threat} ({tags})" if tags else threat
             conn.execute(
                 "INSERT OR REPLACE INTO bad_indicators "
                 "(value, source, note, indicator_type, last_seen) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (host, "abuse.ch/URLhaus", note, "domain", dateadded))
+                (host, "abuse.ch/URLhaus", note, indicator_type, dateadded))
             count += 1
 
     conn.commit()

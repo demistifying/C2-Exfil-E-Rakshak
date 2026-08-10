@@ -9,16 +9,27 @@
 *.cap
 *.crdownload
 # Ignore data/ CONTENTS (not the dir itself) so specific subpaths can be
-# re-included below. (Git can't descend into a fully-excluded directory.)
+# re-included below. (Git can't descend into a fully-excluded directory, so
+# each re-included directory needs its own negation before its contents.)
 data/*
-
-# KEEP these two small fixtures (force-tracked below via `git add -f`):
-#   data/ground_truth.json
-#   data/access_events_fixture.json
 
 # KEEP shipped model artifacts + their training corpora (small, must ship:
 # inference needs the JSON weights; retraining needs the wordlist/benign lists).
 !data/models/
+
+# KEEP the threat-intel feed snapshots (~210 KB). These are abuse.ch indicator
+# lists, not samples or traffic — no PII, no executable content. They ship so
+# that a fresh clone can rebuild data/threatintel.sqlite offline with
+# `python scripts/seed_threatintel.py`. Without them an integrator gets the
+# three built-in demo seeds and every reputation/attribution finding is empty.
+# See data/feeds/README.md for provenance and refresh instructions.
+!data/feeds/
+
+# KEEP these small fixtures (previously force-tracked via `git add -f`;
+# negated here so the repository is reproducible without manual steps).
+!data/ground_truth.json
+!data/access_events_fixture.json
+!data/static_prior_agenttesla.json
 
 # ---------- Generated / regenerable artifacts ----------
 output/

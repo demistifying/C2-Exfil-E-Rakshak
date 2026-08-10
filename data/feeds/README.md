@@ -13,24 +13,46 @@ Terms of use: <https://feodotracker.abuse.ch/blocklist/> and
 <https://urlhaus.abuse.ch/api/>. abuse.ch feeds are free for non-commercial and
 research use; retain this attribution if the database is redistributed.
 
-## Refreshing
+These snapshots are committed (~210 KB total). They are indicator lists — no
+samples, no traffic, no PII, nothing executable — so a fresh clone can rebuild
+the database offline without anyone having to source feeds first.
 
-Download the feeds on a connected machine, drop them here, and re-run the
-import air-gapped:
+## Seeding a fresh clone
 
-    python -c "import sys; sys.path.insert(0,'pipeline'); \
-      from feed_import import refresh, db_stats; \
-      print(refresh('data/feeds')); print(db_stats())"
+`data/threatintel.sqlite` is a build artifact and is *not* committed. Rebuild it
+once after cloning, before any analysis run:
 
-## Post-import cleaning applied to this snapshot
+    python scripts/seed_threatintel.py
 
-URLhaus' text feed lists URLs, not indicators, so conversion needs three fixes
-that `import_urlhaus` does not make on its own:
+Skip this and the only indicators present are the three demo seeds in
+`attribution.init_threatintel_db()`; every reputation and attribution finding
+comes back empty, which looks exactly like the module being broken.
 
-1. the CSV header row is otherwise ingested as an indicator (`url`, `dst_ip`);
-2. URL hosts that are bare IP addresses arrive typed as `domain` and must be
-   reclassified, or an IP will never match an IP lookup;
-3. `*.abuse.ch` must be dropped — the feed references its own site, and flagging
-   the provider as malicious would be an obvious false positive in a report.
+## Refreshing the snapshots
 
-Snapshot after cleaning: 644 indicators (568 IP, 76 domain, 4 JA3).
+Download the current feeds on a connected machine, replace the files here
+(keeping the `feodo*` / `urlhaus*` filename prefixes, which is how `refresh()`
+recognises them), then re-run the seeder air-gapped:
+
+    python scripts/seed_threatintel.py --rebuild
+
+## Normalisation applied at import
+
+URLhaus publishes URLs, not indicators, so `import_urlhaus` normalises three
+things. These were previously manual post-import cleaning steps recorded only in
+this file, which meant `refresh()` rebuilt a subtly wrong database while
+appearing to reproduce the shipped one. They are now enforced in code:
+
+1. a bare header row is skipped, rather than stored as an indicator literally
+   named `url` (and `dst_ip` for Feodo, which is now guarded by validating that
+   the value parses as an address);
+2. URL hosts that are bare IP addresses are typed `ip`, not `domain` — roughly
+   seven in eight URLhaus hosts are raw addresses, and mistyping them means an
+   IP lookup can never match, so the feed contributes nothing;
+3. `abuse.ch` and its subdomains are dropped — every row carries a
+   `urlhaus_link` back to the site, and flagging the intelligence provider as a
+   C2 is a false positive an officer would rightly distrust.
+
+Snapshot after normalisation: 644 indicators (568 IP, 76 domain, 4 JA3).
+`scripts/seed_threatintel.py` fails if the rebuilt total falls below 500, so a
+feed-format change is caught loudly instead of leaving a near-empty database.

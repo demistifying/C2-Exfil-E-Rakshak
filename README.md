@@ -99,16 +99,33 @@ Exports discovered IOCs from `output/exfil_events.json` to:
 
 ## Threat-Intel Feed Import
 
+**Run this once after cloning, before any analysis.** The abuse.ch snapshots
+ship in `data/feeds/`, but `data/threatintel.sqlite` is a build artifact and is
+not committed, so a fresh clone starts with only three demo indicators — every
+reputation and attribution finding comes back empty until you seed:
+
+```bash
+python scripts/seed_threatintel.py            # rebuild from data/feeds/ (offline)
+python scripts/seed_threatintel.py --rebuild  # discard and re-import from scratch
+```
+
+Individual importers, if you need finer control:
+
 ```bash
 # Seed known-bad JA3 hashes (Cobalt Strike, Metasploit, etc.)
 python pipeline/feed_import.py ja3
 
-# Import Feodo Tracker C2 IPs (download CSV from abuse.ch first)
-python pipeline/feed_import.py feodo data/feodotracker.csv
+# Import Feodo Tracker C2 IPs (a snapshot ships in data/feeds/)
+python pipeline/feed_import.py feodo data/feeds/feodo_ipblocklist.csv
 
 # Import URLhaus URLs
-python pipeline/feed_import.py urlhaus data/urlhaus.csv
+python pipeline/feed_import.py urlhaus data/feeds/urlhaus_online.csv
+
+python pipeline/feed_import.py stats          # what's currently loaded
 ```
+
+No importer makes a network call. Refreshing the snapshots is a deliberate,
+manual act performed on a connected machine — see `data/feeds/README.md`.
 
 All imports are designed for **offline use**: download the CSVs once on a
 connected machine, then run the import air-gapped.

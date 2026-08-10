@@ -181,7 +181,7 @@ def load_handoff(path: str, *, strict: bool = False) -> Handoff:
     bundle_dir = os.path.dirname(os.path.abspath(path))
 
     def _resolve(rel):
-        return os.path.join(bundle_dir, rel) if rel else None
+        return os.path.normpath(os.path.join(bundle_dir, rel)) if rel else None
 
     # correlation.access_events_path is the authoritative location; fall back to
     # artifact_paths.access_events, then to the contract's fixed default.
