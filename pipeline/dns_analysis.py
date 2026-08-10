@@ -219,3 +219,79 @@ def detect_doh(tls, http) -> list[str]:
         if h.host and h.host.lower() in KNOWN_DOH:
             hits.add(h.host.lower())
     return sorted(hits)
+
+# --- resolved-destination candidates (the simulated-network case) ------------
+# Under network_mode=simulated_inetsim every connection terminates at the
+# responder, so the destination IP is always the simulator and carries no
+# attribution. The malware's ACTUAL intended destination survives only in the
+# DNS query name. A sample can therefore be fully analysed, produce a correct
+# "no C2 connections" result, and still have named its C2 out loud.
+#
+# The other DNS detectors here look for ANOMALOUS names (algorithmic, tunnelled).
+# A real C2 is frequently an ordinary, legitimate-looking domain — abused webmail
+# and cloud services are the common exfil channel for AgentTesla/Snake-Keylogger
+# style stealers — so anomaly detection alone never sees them.
+#
+# Baseline of expected operating-system and vendor background traffic. Matched
+# domains are still emitted, tiered 'allowlisted' — surfaced, never hidden.
+_OS_BACKGROUND_SUFFIXES = (
+    "microsoft.com", "windowsupdate.com", "windows.com", "msftncsi.com",
+    "msftconnecttest.com", "skype.com", "live.com", "office.com", "office365.com",
+    "msedge.net", "azureedge.net", "akadns.net", "digicert.com", "verisign.com",
+    "sectigo.com", "identrust.com", "globalsign.com", "letsencrypt.org",
+    "gstatic.com", "googleapis.com", "google.com", "mozilla.com", "mozilla.net",
+    "ubuntu.com", "ntp.org", "in-addr.arpa", "ip6.arpa", "local", "localdomain",
+)
+
+
+def _is_os_background(domain: str) -> bool:
+    d = (domain or "").lower().rstrip(".")
+    return any(d == suffix or d.endswith("." + suffix) for suffix in _OS_BACKGROUND_SUFFIXES)
+
+
+def detect_resolved_destinations(dns, already: set[str] | None = None,
+                                 allow_domains: set[str] | None = None) -> list[DnsFinding]:
+    """Every distinct name the sample resolved, as a C2/exfil CANDIDATE.
+
+    A DNS query is a candidate, never a verdict — the same rule this module
+    applies to beaconing. Resolution proves intent to contact, not contact, and
+    certainly not malice. Tiering is decided downstream by corroboration
+    (reputation hit, static-prior match); this detector only ensures the
+    destination is visible instead of being discarded because the connection
+    landed on a simulator.
+    """
+    already = {d.lower() for d in (already or set())}
+    allow = {d.lower() for d in (allow_domains or set())}
+    counts: dict[str, int] = {}
+    for q in dns:
+        name = (getattr(q, "query", "") or "").lower().rstrip(".")
+        if not name or "." not in name:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+
+    findings: list[DnsFinding] = []
+    for name, n in sorted(counts.items()):
+        if name in already:
+            continue                      # a more specific detector already owns it
+        background = _is_os_background(name) or name in allow or _registered_domain(name) in allow
+        findings.append(DnsFinding(
+            kind="resolved_domain",
+            domain=name,
+            query_count=n,
+            avg_entropy=_entropy(_subdomain(name) or name),
+            avg_sub_len=float(len(_subdomain(name))),
+            tunnel_rt_fraction=0.0,
+            unique_ratio=0.0,
+            nxdomain_ratio=0.0,
+            # A resolution is a candidate, not a verdict. Background traffic is
+            # scored to nothing; everything else stays weak until corroborated.
+            confidence=0.0 if background else 0.4,
+            evidence=(
+                f"{name} was resolved {n} time(s). "
+                + ("Matches expected operating-system or vendor background traffic."
+                   if background else
+                   "Not part of expected operating-system background traffic — treat as a "
+                   "destination the sample intended to contact.")
+            ),
+        ))
+    return findings

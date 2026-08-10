@@ -50,6 +50,7 @@ MITRE = {  # capability -> ATT&CK technique
     "http_c2": "T1071.001",               # Application Layer Protocol: Web (gate)
     "icmp_tunnel": "T1095",               # Non-Application Layer Protocol
     "port_mismatch": "T1571",             # Non-Standard Port
+    "resolved_domain": "T1071.004",     # Application Layer Protocol: DNS (intended destination)
     "static_ioc": "T1071",                # C2 extracted from binary (dormant)
     "unclassified_egress": "T1041",       # Exfiltration Over C2 Channel (catch-all)
 }
@@ -247,8 +248,9 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # often private, resolver) — so these are keyed by domain and their private
     # resolver IP is recorded but not filtered. A tunnel is multi-signal by
     # construction, so it is "strong" unless the resolver/domain is known-bad.
+    from allowlist import load_allowlist
     from dns_analysis import (detect_dns_tunneling, detect_dga, detect_dga_ml,
-                              detect_doh)
+                              detect_doh, detect_resolved_destinations)
     dns_ts = iso(min((q.ts for q in bundle.dns), default=conns[0].ts if conns else 0))
     stat_dga = detect_dga(bundle.dns)
     for f in detect_dns_tunneling(bundle.dns) + stat_dga:
@@ -280,6 +282,32 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
             "confidence_tier": "confirmed" if rep else "weak",
             "dns_evidence": f.evidence,
         })
+    # --- resolved destinations (essential under simulated_inetsim) -----------
+    # With a simulated network every connection terminates at the responder, so
+    # the destination IP carries no attribution and the sample's real intended
+    # destination survives only as a DNS name. Emitting resolved names as
+    # candidates is the only way a simulated run can produce a C2 mapping at all.
+    # A resolution is intent to contact, never proof of contact or of malice, so
+    # these stay WEAK unless independently corroborated — the same rule applied
+    # to beaconing. Background OS/vendor traffic is emitted at 'allowlisted':
+    # surfaced for completeness, never asserted.
+    already_dns = stat_domains | {f.domain for f in detect_dga_ml(bundle.dns, already=stat_domains)}
+    allow_domains, _ = load_allowlist()
+    for f in detect_resolved_destinations(bundle.dns, already=already_dns,
+                                          allow_domains=allow_domains):
+        resolver = f.resolver_ips[0] if f.resolver_ips else ""
+        rep = bool(resolver and attribute(resolver).reputation_hit)
+        background = f.confidence == 0.0
+        events.append({
+            "kind": "resolved_domain", "dst_ip": None, "dst_port": None,
+            "timestamp": dns_ts, "confidence": f.confidence, "reputation_hit": rep,
+            "geo_country": None, "asn": None, "asn_org": None,
+            "destination_domain": f.domain, "ja3_hash": None,
+            "plaintext_available": False,
+            "confidence_tier": "allowlisted" if background else "weak",
+            "dns_evidence": f.evidence,
+        })
+
     doh_hits = detect_doh(bundle.tls, bundle.http)   # informational
 
     # --- application-service exfil: cloud/SaaS + SMTP ---
@@ -509,6 +537,7 @@ _FINDING_KIND = {
     "dga": "dns",
     "dga_ml": "dns",
     "dns_tunnel": "dns",
+    "resolved_domain": "dns",
     "icmp_tunnel": "covert_channel",
     "port_mismatch": "covert_channel",
     "tls_cert": "reputation",
@@ -569,6 +598,13 @@ def _plain_language(row: dict, native_kind: str | None, correlated_ctx=None) -> 
                 f"channel, which can be used to avoid monitoring.")
     elif native_kind in ("exfil", "smtp_exfil"):
         base = f"This sample uploaded data from the computer to {dest}{where}."
+    elif native_kind == "resolved_domain":
+        # CRITICAL: a resolution is not a connection. Under a simulated network
+        # the sample may name its destination and never reach it. Saying "sent
+        # data to" here would assert an egress that did not happen.
+        base = (f"This sample looked up the address of {dest}, indicating it "
+                f"intended to contact that destination. No connection to it was "
+                f"observed.")
     elif native_kind == "tls_cert":
         base = (f"Encrypted traffic to {dest}{where} matched a fingerprint "
                 f"associated with known malicious software.")
