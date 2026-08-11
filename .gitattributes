@@ -1,0 +1,15 @@
+# Normalise line endings so a Windows editor touching a file does not produce a
+# whole-file diff. data/feeds/urlhaus_online.csv was rewritten with CRLF and
+# showed 1,744 changed lines with zero content change, which buries real edits
+# in review.
+* text=auto eol=lf
+
+# Threat-intel feed snapshots are parsed line-by-line and diffed during review.
+*.csv text eol=lf
+
+# Binary — never touch, never diff.
+*.pcap  binary
+*.pcapng binary
+*.cap    binary
+*.sqlite binary
+*.etl    binary

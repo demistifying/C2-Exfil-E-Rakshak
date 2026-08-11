@@ -53,6 +53,20 @@ appearing to reproduce the shipped one. They are now enforced in code:
    `urlhaus_link` back to the site, and flagging the intelligence provider as a
    C2 is a false positive an officer would rightly distrust.
 
-Snapshot after normalisation: 644 indicators (568 IP, 76 domain, 4 JA3).
+4. hosts belonging to shared hosting, CDN and file-sharing services are dropped
+   (`_SHARED_HOSTING`). URLhaus is a *URL* blocklist: when a payload is uploaded
+   to a legitimate service, the malicious indicator is the URL, not the host.
+   Before this filter the snapshot contained `github.com`,
+   `raw.githubusercontent.com`, `drive.google.com`, `www.dropbox.com` and seven
+   others, and a benign capture scored `github.com` as **confirmed malicious**
+   with the note "malware_download". One such finding in front of a review
+   committee discredits every other finding in the report.
+
+Snapshot after normalisation: **634 indicators (567 IP, 63 domain, 4 JA3)**.
 `scripts/seed_threatintel.py` fails if the rebuilt total falls below 500, so a
 feed-format change is caught loudly instead of leaving a near-empty database.
+
+The shared-hosting list can never be complete, which is the deeper reason a
+URL-derived *domain* indicator is weak evidence. The filter removes the worst
+offenders; the corroboration rule is what actually stops a lone indicator from
+becoming a verdict.

@@ -111,6 +111,40 @@ def import_feodo(csv_path: str, db_path: str = _REP_DB) -> int:
 # rightly, distrust.
 _FEED_SELF_REFERENCE = ("abuse.ch",)
 
+# Shared hosting, CDNs and file-sharing services.
+#
+# URLhaus is a URL blocklist, not a domain blocklist. When an attacker uploads a
+# payload to a legitimate service, the malicious indicator is the *URL* —
+# https://raw.githubusercontent.com/<attacker>/<repo>/payload.exe — not the host.
+# Reducing that to the host and storing it as a bad domain brands GitHub itself
+# as malware infrastructure.
+#
+# This is not hypothetical. Before this filter the shipped snapshot contained
+# github.com, raw.githubusercontent.com, drive.google.com, www.dropbox.com and
+# seven others; a benign capture scored github.com as 'confirmed malicious' with
+# the note "malware_download". In front of a review committee, one such finding
+# discredits every other finding in the report.
+#
+# The list cannot ever be complete, which is the deeper reason URL-derived
+# *domain* indicators are weak evidence. It removes the worst offenders; the
+# corroboration rule is what actually keeps a lone indicator from becoming a
+# verdict.
+_SHARED_HOSTING = (
+    "github.com", "githubusercontent.com", "github.io", "gitlab.com", "bitbucket.org",
+    "sourceforge.net", "gitea.com", "codeberg.org",
+    "google.com", "googleapis.com", "googleusercontent.com", "googledrive.com", "goo.gl",
+    "dropbox.com", "dropboxusercontent.com", "onedrive.com", "onedrive.live.com",
+    "sharepoint.com", "1drv.ms", "mediafire.com", "mega.nz", "box.com",
+    "discord.com", "discordapp.com", "discordapp.net", "telegram.org", "t.me",
+    "amazonaws.com", "cloudfront.net", "azureedge.net", "blob.core.windows.net",
+    "r2.dev", "cloudflarestorage.com", "backblazeb2.com", "digitaloceanspaces.com",
+    "herokuapp.com", "vercel.app", "vercel-storage.com", "netlify.app", "glitch.me",
+    "firebaseapp.com", "firebasestorage.googleapis.com", "web.app", "pages.dev",
+    "workers.dev", "repl.co", "replit.dev", "ngrok.io", "ngrok-free.app",
+    "blogspot.com", "wordpress.com", "wixsite.com", "weebly.com", "webflow.io",
+    "pastebin.com", "paste.ee", "ghostbin.com", "archive.org", "sites.google.com",
+)
+
 
 def _is_ip_literal(host: str) -> bool:
     """True when a URL host is a bare address rather than a name.
@@ -180,6 +214,14 @@ def import_urlhaus(csv_path: str, db_path: str = _REP_DB) -> int:
 
             # (3) Type the indicator by what it actually is, so IP lookups hit.
             indicator_type = "ip" if _is_ip_literal(host) else "domain"
+
+            # (4) Never brand a shared host from a URL feed. A bare IP serving a
+            #     payload is itself the distribution point and is kept; a name
+            #     belonging to a hosting provider is not evidence about that
+            #     provider. See _SHARED_HOSTING.
+            if indicator_type == "domain" and any(
+                    host == d or host.endswith("." + d) for d in _SHARED_HOSTING):
+                continue
 
             note = f"{threat} ({tags})" if tags else threat
             conn.execute(
