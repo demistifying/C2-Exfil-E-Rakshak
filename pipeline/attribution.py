@@ -39,8 +39,10 @@ class Attribution:
 
 # ----- GeoIP / ASN ---------------------------------------------------------
 
-_DEFAULT_GEO_DB = "data/GeoLite2-City.mmdb"
-_DEFAULT_ASN_DB = "data/GeoLite2-ASN.mmdb"
+from datapaths import data_path, resolve as _resolve_data
+
+_DEFAULT_GEO_DB = data_path("GeoLite2-City.mmdb")
+_DEFAULT_ASN_DB = data_path("GeoLite2-ASN.mmdb")
 
 # Module-level values are kept for backwards compatibility with anything that
 # imports them, but the lookup resolves the environment at CALL time.
@@ -62,8 +64,8 @@ def _geo_db_paths() -> tuple[str, str]:
     None while the default path happened not to exist, so it passed for the
     wrong reason and never exercised the override at all.
     """
-    return (os.environ.get("GEOLITE2_CITY_DB", _DEFAULT_GEO_DB),
-            os.environ.get("GEOLITE2_ASN_DB", _DEFAULT_ASN_DB))
+    return (_resolve_data("GEOLITE2_CITY_DB", "GeoLite2-City.mmdb"),
+            _resolve_data("GEOLITE2_ASN_DB", "GeoLite2-ASN.mmdb"))
 
 
 def _geo_lookup(ip: str) -> tuple[str | None, str | None, str | None]:
@@ -87,7 +89,11 @@ def _geo_lookup(ip: str) -> tuple[str | None, str | None, str | None]:
 
 # ----- Reputation (local threat-intel DB) ----------------------------------
 
-_REP_DB = os.environ.get("THREATINTEL_DB", "data/threatintel.sqlite")
+# Module-relative, NOT cwd-relative. Under UMAT the orchestrator runs with its
+# working directory set to a per-run scratch workspace, where "data/..." does
+# not exist — so the whole threat-intel database silently contributed nothing
+# to every deployed run. See pipeline/datapaths.py.
+_REP_DB = os.environ.get("THREATINTEL_DB") or data_path("threatintel.sqlite")
 
 
 def init_threatintel_db(path: str = _REP_DB, seed: bool = True) -> None:

@@ -44,9 +44,17 @@ DEFAULT_DOMAINS = {
 }
 
 
-def load_allowlist(path: str = "data/allowlist.json"):
+def load_allowlist(path: str | None = None):
     """Return (domains:set, cidrs:list). Merges the default set with an optional
-    site-specific JSON file ({"domains": [...], "cidrs": [...]})."""
+    site-specific JSON file ({"domains": [...], "cidrs": [...]}).
+
+    The site file is resolved relative to the MODULE, and overridable with
+    C2_ALLOWLIST. It was previously "data/allowlist.json" relative to the cwd,
+    which under UMAT is a per-run scratch directory — so a deployment's
+    site-specific allowlist would never have been read.
+    """
+    from datapaths import resolve as _resolve_data
+    path = path or _resolve_data("C2_ALLOWLIST", "allowlist.json")
     domains = set(DEFAULT_DOMAINS)
     cidrs = []
     if os.path.exists(path):

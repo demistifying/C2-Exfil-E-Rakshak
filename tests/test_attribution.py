@@ -109,3 +109,43 @@ class TestGeoGracefulDegradation:
         assert a.geo_country is None
         assert a.asn is None
         assert a.reputation_hit is True   # reputation still works
+
+
+class TestDataPathsAreModuleRelative:
+    """Bundled data must resolve against the MODULE, never the cwd.
+
+    UMAT's SubprocessC2Runtime launches the orchestrator with
+    cwd=<per-run scratch workspace>, where no data/ directory exists. While
+    these defaults were cwd-relative, every deployed run silently lost the
+    threat-intel database, GeoLite2 and the site allowlist — a known-bad C2
+    came back clean, with no error, because "no intelligence loaded" and
+    "destination is not known bad" produce identical output.
+    """
+
+    def test_reputation_resolves_from_any_working_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)            # a cwd with no data/ — as UMAT runs us
+        monkeypatch.delenv("THREATINTEL_DB", raising=False)
+        from pipeline.attribution import _REP_DB
+        assert os.path.isabs(_REP_DB), "threat-intel default must be absolute"
+
+    def test_geolite_paths_resolve_from_any_working_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("GEOLITE2_CITY_DB", raising=False)
+        monkeypatch.delenv("GEOLITE2_ASN_DB", raising=False)
+        from pipeline.attribution import _geo_db_paths
+        for p in _geo_db_paths():
+            assert os.path.isabs(p), f"GeoLite2 default must be absolute: {p}"
+
+    def test_allowlist_resolves_from_any_working_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("C2_ALLOWLIST", raising=False)
+        from pipeline.allowlist import load_allowlist
+        domains, _ = load_allowlist()
+        assert domains, "built-in allowlist must load regardless of cwd"
+
+    def test_environment_override_still_wins(self, tmp_path, monkeypatch):
+        target = tmp_path / "elsewhere.sqlite"
+        target.write_text("")
+        monkeypatch.setenv("THREATINTEL_DB", str(target))
+        from pipeline.datapaths import resolve
+        assert resolve("THREATINTEL_DB", "threatintel.sqlite") == str(target)
