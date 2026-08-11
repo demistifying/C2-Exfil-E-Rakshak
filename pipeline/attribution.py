@@ -39,20 +39,44 @@ class Attribution:
 
 # ----- GeoIP / ASN ---------------------------------------------------------
 
-_GEO_DB = os.environ.get("GEOLITE2_CITY_DB", "data/GeoLite2-City.mmdb")
-_ASN_DB = os.environ.get("GEOLITE2_ASN_DB", "data/GeoLite2-ASN.mmdb")
+_DEFAULT_GEO_DB = "data/GeoLite2-City.mmdb"
+_DEFAULT_ASN_DB = "data/GeoLite2-ASN.mmdb"
+
+# Module-level values are kept for backwards compatibility with anything that
+# imports them, but the lookup resolves the environment at CALL time.
+_GEO_DB = os.environ.get("GEOLITE2_CITY_DB", _DEFAULT_GEO_DB)
+_ASN_DB = os.environ.get("GEOLITE2_ASN_DB", _DEFAULT_ASN_DB)
+
+
+def _geo_db_paths() -> tuple[str, str]:
+    """Resolve the GeoLite2 paths from the environment on every lookup.
+
+    These were previously captured at import time, which made
+    GEOLITE2_CITY_DB / GEOLITE2_ASN_DB documented overrides that silently did
+    nothing — the module is imported long before any caller sets them. A
+    deployment pointing at, say, /srv/winstdt/geoip/ would have been ignored and
+    every finding would have shipped with no country and no ASN, with no error
+    to explain why.
+
+    It went unnoticed because the graceful-degradation test asserted geo was
+    None while the default path happened not to exist, so it passed for the
+    wrong reason and never exercised the override at all.
+    """
+    return (os.environ.get("GEOLITE2_CITY_DB", _DEFAULT_GEO_DB),
+            os.environ.get("GEOLITE2_ASN_DB", _DEFAULT_ASN_DB))
 
 
 def _geo_lookup(ip: str) -> tuple[str | None, str | None, str | None]:
     """Returns (country, asn, asn_org). Fully offline via GeoLite2 .mmdb."""
     country = asn = asn_org = None
+    geo_db, asn_db = _geo_db_paths()
     try:
         import geoip2.database  # type: ignore
-        if os.path.exists(_GEO_DB):
-            with geoip2.database.Reader(_GEO_DB) as r:
+        if os.path.exists(geo_db):
+            with geoip2.database.Reader(geo_db) as r:
                 country = r.city(ip).country.iso_code
-        if os.path.exists(_ASN_DB):
-            with geoip2.database.Reader(_ASN_DB) as r:
+        if os.path.exists(asn_db):
+            with geoip2.database.Reader(asn_db) as r:
                 resp = r.asn(ip)
                 asn = f"AS{resp.autonomous_system_number}"
                 asn_org = resp.autonomous_system_organization

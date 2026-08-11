@@ -97,6 +97,27 @@ Exports discovered IOCs from `output/exfil_events.json` to:
 - `output/iocs.csv` — flat CSV for SIEM ingestion
 - `output/iocs_stix.json` — STIX 2.1 bundle with indicators and relationships
 
+## GeoIP / ASN enrichment (one-time setup)
+
+Geo and ASN come from MaxMind **GeoLite2**, looked up locally with no network
+call. The `.mmdb` files are ~82 MB and MaxMind's licence does not permit
+redistribution, so they are gitignored and must be fetched once per host:
+
+1. Create a free MaxMind account and download **GeoLite2 City** and
+   **GeoLite2 ASN** (`.mmdb` format).
+2. Place both in `data/`, or point at them explicitly:
+
+```bash
+export GEOLITE2_CITY_DB=/srv/winstdt/geoip/GeoLite2-City.mmdb
+export GEOLITE2_ASN_DB=/srv/winstdt/geoip/GeoLite2-ASN.mmdb
+```
+
+Without them, attribution degrades gracefully: reputation still works, but every
+finding ships with `geo_country`, `asn` and `asn_org` empty and **no error is
+raised**. On a real run that is the difference between an officer reading
+`23.37.85.220` and reading `23.37.85.220 — Akamai Technologies, India`, which is
+often what tells an analyst a destination is a CDN rather than a C2.
+
 ## Threat-Intel Feed Import
 
 **Run this once after cloning, before any analysis.** The abuse.ch snapshots
