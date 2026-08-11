@@ -34,8 +34,38 @@ def _load_events(path: str = "output/exfil_events.json") -> list[dict]:
         return json.load(f)
 
 
+# Tiers that must never leave the module as an indicator OF COMPROMISE.
+#
+# `allowlisted` is not a weak finding — it is a destination this module has
+# explicitly judged benign, and it ranks BELOW every threat tier in the
+# confidence vocabulary. Exporting it inverts its meaning.
+#
+# Observed on the AgentTesla run: 11 of 15 exported indicators were allowlisted,
+# so the officer's "Indicators of compromise" table listed windowsupdate.com,
+# login.live.com, ocsp.digicert.com and fs.microsoft.com. Fed to a SIEM, that
+# CSV is an instruction to alert on Windows Update.
+#
+# Everything at `unconfirmed` and above is still exported. Those are candidates,
+# and under a recall-first forensic posture a candidate belongs in the feed with
+# its tier attached — the tier column is how the consumer decides what to act on.
+_NOT_AN_INDICATOR = {"allowlisted"}
+
+
+def _reportable(events: list[dict]) -> list[dict]:
+    """Drop rows whose tier means 'judged not a threat'.
+
+    Shared by both exporters deliberately. The CSV and STIX paths have drifted
+    apart before — a domain-only indicator reached one and not the other — and a
+    filter applied in two places is a filter that will eventually disagree with
+    itself.
+    """
+    return [e for e in events
+            if str(e.get("confidence_tier", "")).lower() not in _NOT_AN_INDICATOR]
+
+
 def export_csv(events: list[dict], output_path: str = "output/iocs.csv") -> int:
     """Export IOCs as a flat CSV suitable for ingestion by SIEMs or sharing."""
+    events = _reportable(events)
     if not events:
         return 0
 
@@ -77,6 +107,7 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
       * observed-data objects linking to the original events
       * relationship objects connecting indicators to observed-data
     """
+    events = _reportable(events)
     if not events:
         return 0
 
@@ -184,12 +215,19 @@ def export_stix(events: list[dict], output_path: str = "output/iocs_stix.json",
 
 
 def _stix_confidence(tier: str) -> int:
-    """Map our 4-tier confidence to STIX confidence (0-100)."""
+    """Map our 5-tier confidence to STIX confidence (0-100).
+
+    `allowlisted` is filtered out before export (see _reportable), so it should
+    never reach here — it is listed anyway so the map matches the vocabulary and
+    an allowlisted row can never fall through to the `unconfirmed` default and
+    be published at confidence 15.
+    """
     return {
         "confirmed": 95,
         "strong": 75,
         "weak": 40,
         "unconfirmed": 15,
+        "allowlisted": 0,
     }.get(tier, 15)
 
 

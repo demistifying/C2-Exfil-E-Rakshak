@@ -74,8 +74,19 @@ class ProvenanceRecord:
 
     def statement(self) -> str:
         who = self.destination_domain or self.destination_ip
-        verb = "was (inferred to be) exfiltrated" if self.inferred else "was exfiltrated"
         via = f" via {self.accessed_via}" if self.accessed_via else ""
+        if self.confidence_tier == "allowlisted":
+            # Not an exfiltration claim. A sanctioned service received routine
+            # traffic that happened to fall inside the correlation window after
+            # a file read. Tagging the tier at the end of an "was exfiltrated"
+            # sentence does not undo the accusation the sentence just made —
+            # the verb itself has to change.
+            return (f"{self.item_type}{via} at {self.accessed_at} was read, and "
+                    f"routine background traffic to {who} followed at "
+                    f"{self.exfiltrated_at} (+{self.time_delta_s}s). {who} is a "
+                    f"known-good service; no transfer of this item is claimed. "
+                    f"[{self.confidence_tier}]")
+        verb = "was (inferred to be) exfiltrated" if self.inferred else "was exfiltrated"
         recovered = ""
         if self.recovered_bytes:
             recovered = (f" — recovered {self.recovered_bytes} B "
@@ -126,6 +137,16 @@ def build_provenance(correlated, network_events: list[dict],
         if cur is None or a.total_bytes > cur.total_bytes:
             art_by_dst[a.dest_ip] = a
 
+    # Provenance is built from `correlated` directly, so it never saw
+    # apply_allowlist() (which runs over network events) nor the down-tiering in
+    # emit_schema_rows(). On the AgentTesla run that produced seven records
+    # asserting that a file "was (inferred to be) exfiltrated to
+    # v10.events.data.microsoft.com" — the report accusing Windows telemetry of
+    # receiving stolen data. Same rule as everywhere else: weak only, so a
+    # strong or confirmed hit against a sanctioned service still stands out.
+    from allowlist import is_allowlisted, load_allowlist
+    _allow = load_allowlist()
+
     records: list[ProvenanceRecord] = []
     for c in correlated:
         net = (net_by_dst.get((c.destination_ip, c.destination_port))
@@ -136,6 +157,10 @@ def build_provenance(correlated, network_events: list[dict],
         item = _refine_item(base, descriptor)
         inferred = not bool(net.get("plaintext_available"))
         art = art_by_dst.get(c.destination_ip)
+        tier = c.confidence_tier
+        if tier == "weak" and is_allowlisted(
+                net.get("destination_domain"), c.destination_ip, _allow)[0]:
+            tier = "allowlisted"
         records.append(ProvenanceRecord(
             item_type=item, data_type_accessed=c.data_type_accessed,
             accessed_via=c.access_api_call, accessed_at=c.access_ts,
@@ -144,7 +169,7 @@ def build_provenance(correlated, network_events: list[dict],
             exfil_protocol=_PROTOCOL.get(kind, "unknown"),
             exfiltrated_at=c.network_ts, time_delta_s=c.time_delta_s,
             evidence=descriptor, inferred=inferred,
-            confidence_tier=c.confidence_tier,
+            confidence_tier=tier,
             recovered_bytes=art.total_bytes if art else 0,
             recovered_sha256=art.sha256 if art else None,
             recovered_preview=art.preview if art else None))

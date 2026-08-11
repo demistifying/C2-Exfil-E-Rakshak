@@ -707,11 +707,14 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None,
     evidence_refs) are set BEFORE the row is hashed, so they are covered by the
     evidence chain rather than appended outside it.
     """
+    from allowlist import is_allowlisted, load_allowlist
+
     session_id = getattr(handoff, "session_id", None) if handoff else None
     cape_task_id = getattr(handoff, "cape_task_id", None) if handoff else None
     seed = (getattr(handoff, "hash_manifest_sha256", None) if handoff else None) \
         or "0" * 64
     rows, prev = [], seed
+    _allow = load_allowlist()   # loaded once; is_allowlisted() would re-read per row
     # Correlated (host+network) events are the highest-value rows.
     for c in correlated:
         # Find matching network event for enrichment fields
@@ -745,6 +748,31 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None,
             # Prefer the technique resolved at ingestion; fall back to local map.
             "mitre_technique_id": c.mitre_technique_id or MITRE.get(c.data_type_accessed),
         }
+        # A correlation to a SANCTIONED SERVICE is not evidence of exfiltration.
+        #
+        # apply_allowlist() runs over network events only, inside
+        # build_network_events. Correlated rows are assembled here, afterwards,
+        # and took their tier straight from the correlation engine — so the same
+        # destination could be 'allowlisted' as a beacon and 'weak' as a
+        # correlation in one report.
+        #
+        # It is not merely inconsistent, it is a false accusation. OS telemetry
+        # fires continuously, so ANY file read is followed by telemetry traffic
+        # within the correlation window by coincidence. On the AgentTesla run
+        # that produced seven correlations reading "file ... was (inferred to be)
+        # exfiltrated to v10.events.data.microsoft.com" — the report accusing
+        # Windows telemetry of receiving stolen data.
+        #
+        # Same rule as the network-side allowlist: only WEAK is down-tiered.
+        # A strong or confirmed finding against a sanctioned service is genuinely
+        # anomalous and must stay visible for review.
+        if row["confidence_tier"] == "weak":
+            _ok, _matched = is_allowlisted(
+                row.get("destination_domain"), row.get("destination_ip"), _allow)
+            if _ok:
+                row["confidence_tier"] = "allowlisted"
+                row["allowlist_match"] = _matched
+
         # --- schema 1.3 integration fields (inside the hash) ---------------
         row["case_id"] = case_id
         row["finding_kind"] = "correlation"
