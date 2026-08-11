@@ -104,6 +104,33 @@ class TestDeduplication:
         found = _findings(REAL_CAPTURE, already={"accounts.zoho.com"})
         assert "accounts.zoho.com" not in {f.domain for f in found}
 
+    def test_tunnel_subdomains_roll_up_to_the_claimed_parent(self):
+        """A DNS tunnel carries its payload in the subdomain, so one tunnel
+        produces thousands of unique names under a single parent. Claiming only
+        the exact parent string let every encoded label through as its own
+        candidate.
+
+        Measured on the real dnscat2 capture: 6,906 rows emitted, 6,892 of them
+        restating the one tunnel the tunnelling detector had already reported
+        correctly at 'strong'. After rolling up: 16 rows, with the real finding
+        visible instead of buried.
+        """
+        names = [f"{i:032x}.cisco-update.com" for i in range(50)]
+        found = _findings(names, already={"cisco-update.com"})
+        assert found == []
+
+    def test_rollup_matches_any_parent_not_just_the_registered_domain(self):
+        found = _findings(["a.b.tunnel.example.test"],
+                          already={"tunnel.example.test"})
+        assert found == []
+
+    def test_rollup_does_not_suppress_an_unrelated_sibling(self):
+        """Suppression must be scoped to the claimed parent — a different
+        domain that merely shares a suffix must still be reported."""
+        found = _findings(["evil.example", "x.cisco-update.com"],
+                          already={"cisco-update.com"})
+        assert [f.domain for f in found] == ["evil.example"]
+
     def test_site_allowlist_downgrades_to_background(self):
         found = _findings(["accounts.zoho.com"], allow_domains={"accounts.zoho.com"})
         assert found[0].confidence == 0.0

@@ -6,7 +6,7 @@ in collaboration with the Windows ST/DT sandbox module, produces attributed,
 evidence-graded C2/exfiltration findings in a schema shared with the Android
 module.
 
-**Snapshot (Phases 1–4 core complete):** **328 tests passing.** Adds host↔network
+**Snapshot (Phases 1–4 core complete):** **373 tests passing.** Adds host↔network
 correlation hardening (best-match, clock-sync guarded) and **item-level exfil
 provenance** — "which stolen item left via what channel to which destination,
 when" — tested across every item type, every exfil protocol, negatives, window
@@ -124,7 +124,8 @@ external dependency (ETW host events) has a built, tested ingestion interface.
 
 ## 3. Testing — what is covered
 
-**328 tests, all passing** across 24 files. Highest-value groups:
+**373 tests, all passing** across 27 files (plus 3 skipped when the corpus
+captures, which are gitignored, are absent). Highest-value groups:
 
 | Test file | Tests | Covers |
 |---|---:|---|

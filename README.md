@@ -40,7 +40,7 @@ attributed, evidence-graded C2/exfiltration findings in the shared schema.
 | Threat-intel at scale — domain reputation + feed import (Feodo/URLhaus/JA3/JA4/DGA) | ✅ Working | **Yes** — a known-bad domain promotes DNS/cloud/HTTP findings to confirmed |
 | Sanctioned-service allowlist (down-tier weak, never hide; confirmed wins) | ✅ Working | **Yes** — suppresses benign update/telemetry/OCSP egress noise |
 | Family / campaign attribution (static prior + intel + behaviour) | ✅ Working | **Yes** — Redline via intel, Cobalt Strike/dnscat2 via behaviour |
-| Test suite (pytest, 233 tests) | ✅ Working | **Yes** |
+| Test suite (pytest, 373 tests) | ✅ Working | **Yes** |
 
 *Correlation needs host access events from the Windows ST/DT sandbox (ETW).
 That is the one genuine cross-module dependency. Until it lands, correlation

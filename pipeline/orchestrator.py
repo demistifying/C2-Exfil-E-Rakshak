@@ -134,11 +134,21 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     for c in conns:
         first_ts.setdefault((c.dst_ip, c.dst_port), c.ts)
 
-    # Index HTTP host for destination_domain population
+    # Index HTTP host for destination_domain population.
+    #
+    # The Host header is not a domain name. It legitimately carries a port when
+    # the port is non-default, and it is often a bare address — RedLine's C2
+    # sends `Host: 188.190.10.10:55123`. Stored unmodified that produced
+    # destination_domain='188.190.10.10:55123', which is neither a domain nor a
+    # valid IP: the officer sentence read "188.190.10.10:55123 (188.190.10.10)",
+    # and the STIX export emitted domain-name:value = '188.190.10.10:55123'.
+    # Strip the port, and keep the field for names only — the address already
+    # has its own column.
     http_hosts = {}
     for c in conns:
-        if c.http_host:
-            http_hosts.setdefault(c.dst_ip, c.http_host)
+        host = _host_header_domain(c.http_host)
+        if host:
+            http_hosts.setdefault(c.dst_ip, host)
 
     from datetime import datetime, timezone
     def iso(ts):
@@ -253,7 +263,13 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                               detect_doh, detect_resolved_destinations)
     dns_ts = iso(min((q.ts for q in bundle.dns), default=conns[0].ts if conns else 0))
     stat_dga = detect_dga(bundle.dns)
-    for f in detect_dns_tunneling(bundle.dns) + stat_dga:
+    tunnels = detect_dns_tunneling(bundle.dns)
+    # Domains already reported by the tunnelling detector. These MUST be handed
+    # to detect_resolved_destinations below: a tunnel encodes its payload in the
+    # subdomain, so leaving them unclaimed re-reports one tunnel thousands of
+    # times, once per encoded label.
+    tunnel_domains = {f.domain for f in tunnels}
+    for f in tunnels + stat_dga:
         resolver = f.resolver_ips[0] if f.resolver_ips else ""
         rep = bool(resolver and attribute(resolver).reputation_hit)
         events.append({
@@ -291,7 +307,8 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
     # these stay WEAK unless independently corroborated — the same rule applied
     # to beaconing. Background OS/vendor traffic is emitted at 'allowlisted':
     # surfaced for completeness, never asserted.
-    already_dns = stat_domains | {f.domain for f in detect_dga_ml(bundle.dns, already=stat_domains)}
+    already_dns = (tunnel_domains | stat_domains
+                   | {f.domain for f in detect_dga_ml(bundle.dns, already=stat_domains)})
     allow_domains, _ = load_allowlist()
     for f in detect_resolved_destinations(bundle.dns, already=already_dns,
                                           allow_domains=allow_domains):
@@ -554,6 +571,34 @@ def _finding_kind(native_kind: str | None, reputation_hit: bool = False) -> str:
     # Unknown detector: a reputation hit is the honest label, otherwise it is
     # simply observed egress. Never invent a category outside their enum.
     return "reputation" if reputation_hit else "exfil"
+
+
+def _host_header_domain(raw: str | None) -> str | None:
+    """A domain name from an HTTP Host header, or None if it isn't one.
+
+    Returns None for bare IPv4/IPv6 literals so that destination_domain stays a
+    name column. Downstream consumers (the officer sentence, the CSV/STIX IOC
+    export, and UMAT's destination enrichment) all treat a populated
+    destination_domain as a resolvable name.
+    """
+    if not raw:
+        return None
+    host = str(raw).strip().rstrip(".").lower()
+    if not host:
+        return None
+    if host.startswith("["):                      # [2001:db8::1]:8080
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:                    # name:port / ipv4:port
+        host = host.rsplit(":", 1)[0]
+    # A bare address is not a domain. (A bare IPv6 literal has >1 colon and is
+    # left intact by the branches above, so it is caught here too.)
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    return host if "." in host else None
 
 
 def _dest_label(row: dict) -> str:
@@ -824,10 +869,15 @@ def main():
             print(f"[*] sample.meta.json unavailable ({'; '.join(sample_meta.errors)})")
             sample_meta = None
 
-    sample_id = hashlib.sha256(open(pcap, "rb").read()).hexdigest()
-
     # Chain-of-custody: hash all inputs into a reproducible case manifest.
-    from evidence import build_case_manifest
+    from evidence import build_case_manifest, sha256_file
+
+    # Hash in 1 MiB chunks rather than reading the capture into memory. A
+    # forensics workstation is handed whatever the case produced: a 318 MiB
+    # capture cost 338 MiB of RSS this way, so a multi-gigabyte one fails
+    # outright on a machine with less RAM than the evidence. Same digest,
+    # constant memory — sha256_file is the helper the manifest already uses.
+    sample_id = sha256_file(pcap)
     manifest = build_case_manifest(
         pcap=pcap, zeek_dir=zeek_dir,
         parameters={"acc_events": os.path.basename(acc_path)})

@@ -52,6 +52,25 @@ def _subdomain(qname: str) -> str:
     return ".".join(labels[:-2]) if len(labels) > 2 else ""
 
 
+def _claimed_by(name: str, owned: set[str]) -> bool:
+    """True when `name` or any parent of it is already reported by a stronger
+    detector.
+
+    Exact matching is not enough. A DNS tunnel carries its payload in the
+    subdomain, so one tunnel to `cisco-update.com` produces thousands of unique
+    names like `000e018ea027...cisco-update.com`. Matching only the exact string
+    let every one of those through as its own candidate: the dnscat2 capture
+    emitted 6,906 rows, 6,892 of them restating a tunnel that the tunnelling
+    detector had already reported once, correctly, at 'strong'.
+
+    That is not merely noisy — it is misleading. It buries the single real
+    finding, and in the unified case view it would swamp the officer's screen
+    and the findings table with what is genuinely one event.
+    """
+    labels = name.split(".")
+    return any(".".join(labels[i:]) in owned for i in range(len(labels) - 1))
+
+
 @dataclass
 class DnsFinding:
     kind: str                       # "dns_tunnel" | "dga" | "doh"
@@ -271,7 +290,7 @@ def detect_resolved_destinations(dns, already: set[str] | None = None,
 
     findings: list[DnsFinding] = []
     for name, n in sorted(counts.items()):
-        if name in already:
+        if _claimed_by(name, already):
             continue                      # a more specific detector already owns it
         background = _is_os_background(name) or name in allow or _registered_domain(name) in allow
         findings.append(DnsFinding(
