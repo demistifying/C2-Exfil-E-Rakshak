@@ -74,6 +74,32 @@ _DEFAULT_PROVIDER_MAP = {
 }
 
 
+# Every spelling of "the network was faked" / "the network was real" that the
+# producers in this suite emit. Extend here, in one place, rather than at each
+# comparison site — that is how "simulated_inetsim" ended up being the only
+# value recognised while WinST/DT was emitting "live_egress".
+_SIMULATED_MODES = frozenset({
+    "simulated_inetsim", "isolated_simulated", "simulated",
+    "inetsim", "isolated", "no_egress", "offline",
+})
+_REAL_EGRESS_MODES = frozenset({
+    "live_egress", "real_world_egress", "real_egress",
+    "controlled_egress", "internet",
+})
+
+
+def _normalise_network_mode(value: str | None) -> str:
+    """Fold any producer's spelling onto 'simulated' | 'real' | 'unknown'."""
+    if not value:
+        return "unknown"
+    token = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if token in _SIMULATED_MODES:
+        return "simulated"
+    if token in _REAL_EGRESS_MODES:
+        return "real"
+    return "unknown"
+
+
 @dataclass
 class Handoff:
     schema_version: str
@@ -136,7 +162,37 @@ class Handoff:
 
     @property
     def simulated(self) -> bool:
-        return self.network_mode == "simulated_inetsim"
+        """True when responses came from a simulator rather than the internet.
+
+        Three vocabularies describe the same axis and none of them agree:
+
+          WinST/DT manifest   simulated_inetsim | live_egress
+          UMAT submission API isolated_simulated | real_world_egress
+          this module (was)   simulated_inetsim only
+
+        Matching one spelling meant every other value fell through to "not
+        simulated", which is the DANGEROUS default: the "absence is not proof"
+        caveat would be silently dropped on a run that was in fact simulated,
+        and a clean result would read as though the sample had a real internet
+        connection and declined to use it.
+
+        Verified against a real bundle: the AgentTesla run carried
+        network_mode="live_egress", a value this module had never seen.
+        """
+        return _normalise_network_mode(self.network_mode) == "simulated"
+
+    @property
+    def real_egress(self) -> bool:
+        """True when the sample had genuine (brokered) internet access.
+
+        Not merely `not simulated` — an unrecognised or absent mode is neither,
+        and must not be treated as evidence that egress was real.
+        """
+        return _normalise_network_mode(self.network_mode) == "real"
+
+    @property
+    def network_mode_recognised(self) -> bool:
+        return _normalise_network_mode(self.network_mode) != "unknown"
 
     @property
     def tls_pinning_suspected(self) -> bool:
@@ -476,6 +532,23 @@ def gate_network_events(events: list, h: Handoff | None) -> list[str]:
             "ATTEMPTED, not confirmed-delivered. The ABSENCE of exfil here is NOT "
             "evidence the sample is clean — it only means the simulator did not "
             "elicit it. Do not score a simulated run as benign.")
+    elif h.real_egress:
+        notes.append(
+            f"NETWORK LIVE (brokered egress, mode='{h.network_mode}'): the sample "
+            "had genuine outbound access, so a destination it contacted was "
+            "really reached and an absence of contact carries more weight than "
+            "under simulation. It is still not proof of a clean sample: egress "
+            "is filtered by the gateway, so a blocked destination looks the same "
+            "as one that was never attempted.")
+    elif h.network_mode is not None:
+        # An unrecognised value must NEVER silently mean "not simulated". That
+        # would drop the absence-is-not-proof caveat on a run that may well have
+        # been simulated, which is the one direction this module must not err in.
+        notes.append(
+            f"NETWORK MODE UNRECOGNISED ('{h.network_mode}'): this module could "
+            "not determine whether responses came from the internet or a "
+            "simulator, so no claim is made either way. Treat the absence of "
+            "exfil as UNINTERPRETED, not as evidence of a clean sample.")
 
     if not h.clock_quality_acceptable:
         capped = 0

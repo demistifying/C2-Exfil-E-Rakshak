@@ -601,6 +601,29 @@ def _host_header_domain(raw: str | None) -> str | None:
     return host if "." in host else None
 
 
+_MAX_OBJECT_CHARS = 160
+
+
+def _object_label(raw: str | None) -> str | None:
+    """A path safe to put in an officer-facing sentence.
+
+    Kept whole rather than reduced to a leaf name: the directory is what
+    distinguishes a browser credential store from an unrelated file of the same
+    name, and the report has to survive being read as evidence. Only
+    pathological lengths are elided, from the middle, so both the drive root and
+    the filename stay visible.
+    """
+    if not raw:
+        return None
+    text = " ".join(str(raw).split())     # collapse stray whitespace/newlines
+    if not text:
+        return None
+    if len(text) <= _MAX_OBJECT_CHARS:
+        return text
+    keep = (_MAX_OBJECT_CHARS - 3) // 2
+    return f"{text[:keep]}...{text[-keep:]}"
+
+
 def _dest_label(row: dict) -> str:
     d = row.get("destination_domain")
     ip = row.get("destination_ip")
@@ -625,9 +648,22 @@ def _plain_language(row: dict, native_kind: str | None, correlated_ctx=None) -> 
 
     if correlated_ctx is not None:
         what = (correlated_ctx.data_type_accessed or "data").replace("_", " ")
+        # Name the actual item when WinST/DT supplied it. "read file data" tells
+        # an officer nothing; "read C:\...\Edge\User Data\Login Data" is the
+        # finding. Falls back cleanly for bundles predating the rich-context
+        # patch, which carry no object at all.
+        obj = _object_label(getattr(correlated_ctx, "accessed_object", None))
+        if not obj:
+            subject = what
+        elif correlated_ctx.data_type_accessed == "file_access":
+            # "read file access (C:\...)" is how the machine thinks. An officer
+            # reads "read the file C:\...".
+            subject = f"the file {obj}"
+        else:
+            subject = f"{what} from {obj}"
         delta = getattr(correlated_ctx, "time_delta_s", None)
         when = f" {delta:g} seconds later" if isinstance(delta, (int, float)) else ""
-        base = (f"This sample read {what} on the computer and contacted "
+        base = (f"This sample read {subject} on the computer and contacted "
                 f"{dest}{where}{when}.")
     elif native_kind == "static_ioc":
         base = (f"{dest} was found written inside the file itself as a "
@@ -683,12 +719,20 @@ def _evidence_refs(native_kind: str | None, row: dict, correlated_ctx=None) -> l
                      "source": row["reputation_source"],
                      "note": row.get("reputation_note")})
     if correlated_ctx is not None:
-        refs.append({
+        ref = {
             "type": "host_access",
             "data_type": correlated_ctx.data_type_accessed,
             "api_call": correlated_ctx.access_api_call,
             "time_delta_s": getattr(correlated_ctx, "time_delta_s", None),
-        })
+        }
+        # The untruncated path, for analyst drill-down and for court. The
+        # officer sentence carries an elided form; the evidence reference must
+        # not. evidence_refs is a free-form array in c2-event-v1.3, so this
+        # needs no schema change.
+        obj = getattr(correlated_ctx, "accessed_object", None)
+        if obj:
+            ref["object_path"] = str(obj)
+        refs.append(ref)
     return refs
 
 
@@ -826,7 +870,8 @@ def emit_schema_rows(network_events, correlated, sample_id, handoff=None,
     return rows
 
 
-_VALUE_FLAGS = ("--zeek-dir", "--static-prior", "--handoff", "--case-id")
+_VALUE_FLAGS = ("--zeek-dir", "--static-prior", "--handoff", "--case-id",
+                "--etw-events")
 
 
 def parse_args(argv: list[str]) -> dict:
@@ -837,11 +882,26 @@ def parse_args(argv: list[str]) -> dict:
     `orchestrator.py x.pcap --handoff m.json` silently bound acc_path to the
     literal string "--handoff", which failed os.path.exists() and disabled
     correlation with no explanation.
+
+    `--etw-events` is accepted but not acted on. UMAT's SubprocessC2Runtime
+    passes it on every Windows run, and it then performs its own process-bound
+    ETW corroboration downstream (requiring a destination/port/time match bound
+    to the sample's PID before a correlation keeps sample attribution). Doing it
+    here as well would duplicate that judgement in a second place, which is the
+    two-sources-of-truth failure this module keeps having to undo elsewhere.
+
+    It is declared as a VALUE FLAG rather than ignored, because ignoring it is
+    not free: its argument does not begin with '--', so an undeclared flag
+    leaves the path behind as a stray third positional. Today that is harmless
+    (only positionals 0 and 1 are read), but it is the same shape as the
+    --handoff bug above, and it would bite the moment a third positional gains a
+    meaning.
     """
     flags: dict = {"zeek_dir": None, "static_prior_path": None,
-                   "handoff_path": None, "case_id": None}
+                   "handoff_path": None, "case_id": None, "etw_events_path": None}
     key_for = {"--zeek-dir": "zeek_dir", "--static-prior": "static_prior_path",
-               "--handoff": "handoff_path", "--case-id": "case_id"}
+               "--handoff": "handoff_path", "--case-id": "case_id",
+               "--etw-events": "etw_events_path"}
     consumed: set[int] = set()
     for i, a in enumerate(argv):
         if a in _VALUE_FLAGS and i + 1 < len(argv):

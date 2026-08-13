@@ -70,6 +70,21 @@ class ETWAccessEvent:
     raw_timestamp: str = ""        # original string, preserved for evidence
     mitre_technique: str | None = None
     capability: str | None = None
+    # WHAT was touched, not merely that something was. WinST/DT's
+    # 0003-rich-access-event-context patch added these; before it, an event
+    # carried only {timestamp, data_type, api_call, process}, so a report could
+    # say "file accessed via NtCreateFile" 171 times without ever naming a file.
+    # Optional: older bundles predate the patch and must still load.
+    object_path: str | None = None      # full path, e.g. C:\...\Login Data
+    object_name: str | None = None      # leaf name, e.g. Login Data
+    access_operation: str | None = None
+    process_id: int | None = None
+    process_path: str | None = None
+
+    @property
+    def object_label(self) -> str | None:
+        """Shortest unambiguous name for the item touched."""
+        return self.object_path or self.object_name or None
 
     def to_dict(self) -> dict:
         """Shape consumed by correlation.py (backward compatible)."""
@@ -79,6 +94,11 @@ class ETWAccessEvent:
             "api_call": self.api_call,
             "process": self.process,
             "mitre_technique": self.mitre_technique,
+            "object_path": self.object_path,
+            "object_name": self.object_name,
+            "access_operation": self.access_operation,
+            "process_id": self.process_id,
+            "process_path": self.process_path,
         }
 
 
@@ -145,7 +165,21 @@ def parse_event(raw: dict, index: int = 0) -> ETWAccessEvent:
         raw_timestamp=raw["timestamp"],
         mitre_technique=technique,
         capability=capability,
+        object_path=_optional_str(raw.get("object_path")),
+        object_name=_optional_str(raw.get("object_name")),
+        access_operation=_optional_str(raw.get("access_operation")),
+        process_id=raw.get("process_id") if isinstance(raw.get("process_id"), int) else None,
+        process_path=_optional_str(raw.get("process_path")),
     )
+
+
+def _optional_str(value: object) -> str | None:
+    """Trimmed string, or None. Never raises — these fields are optional and a
+    bundle produced before the rich-context patch simply omits them."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def ingest(raw_events, *, strict: bool = False) -> IngestReport:

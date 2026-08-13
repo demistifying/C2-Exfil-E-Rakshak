@@ -447,3 +447,62 @@ class TestStaticPromotion:
         ev = [self._ev("strong")]
         assert promote_with_static_corroboration(ev, None) == []
         assert ev[0]["confidence_tier"] == "strong"
+class TestNetworkModeVocabularies:
+    """Three producers spell the same axis three different ways.
+
+    WinST/DT emits `live_egress`, UMAT's API takes `isolated_simulated` /
+    `real_world_egress`, and this module used to match only `simulated_inetsim`.
+    An unmatched value fell through to "not simulated", silently dropping the
+    absence-is-not-proof caveat.
+    """
+
+    def test_every_known_spelling_is_classified(self):
+        from handoff import _normalise_network_mode
+        for value in ("simulated_inetsim", "isolated_simulated", "SIMULATED",
+                      "no_egress", "offline"):
+            assert _normalise_network_mode(value) == "simulated", value
+        for value in ("live_egress", "real_world_egress", "controlled_egress",
+                      "real-egress"):
+            assert _normalise_network_mode(value) == "real", value
+
+    def test_unknown_mode_is_neither_simulated_nor_real(self):
+        """The dangerous default. An unrecognised value must not imply real
+        egress, because that would present an absence of exfil as meaningful."""
+        from handoff import _normalise_network_mode
+        for value in ("something_new", "", None):
+            assert _normalise_network_mode(value) == "unknown", value
+
+    def test_live_egress_from_the_real_bundle_is_recognised(self):
+        """The AgentTesla run carried network_mode='live_egress' — a value this
+        module had never seen until it appeared in production."""
+        from handoff import _normalise_network_mode
+        assert _normalise_network_mode("live_egress") == "real"
+
+
+class TestAccessedObjectReachesTheReport:
+    """WinST/DT's rich-access-event patch supplies object_path/object_name.
+    Before it, a report could say "file accessed via NtCreateFile" 171 times
+    without naming a single file."""
+
+    def test_object_path_is_ingested(self):
+        from etw_ingest import parse_event
+        ev = parse_event({
+            "timestamp": "2026-08-11T17:30:49.346026Z",
+            "data_type": "file_access", "api_call": "NtReadFile",
+            "process": "sample.exe",
+            "object_path": r"C:\Users\A\AppData\Local\Microsoft\Edge\User Data\Login Data",
+            "object_name": "Login Data",
+        })
+        assert ev.object_path.endswith("Login Data")
+        assert ev.object_label == ev.object_path
+        assert ev.to_dict()["object_path"] == ev.object_path
+
+    def test_bundles_without_the_patch_still_load(self):
+        """Older bundles carry only the four original fields."""
+        from etw_ingest import parse_event
+        ev = parse_event({
+            "timestamp": "2026-08-11T17:30:49.346026Z",
+            "data_type": "file_access", "api_call": "NtReadFile",
+            "process": "sample.exe",
+        })
+        assert ev.object_path is None and ev.object_label is None

@@ -45,6 +45,10 @@ class CorrelatedEvent:
     correlation_confidence: float  # combined score
     confidence_tier: str           # confirmed | strong | weak | unconfirmed
     mitre_technique_id: str | None = None   # ATT&CK id of the host access
+    # The item actually touched, when the bundle carries it. This is what turns
+    # "read file data" into "read C:\...\Edge\User Data\Login Data" in the
+    # officer sentence — the difference between a log line and a finding.
+    accessed_object: str | None = None
 
 
 def _parse(ts) -> datetime:
@@ -128,6 +132,8 @@ def correlate(access_events: list[dict],
                 correlation_confidence=corr,
                 confidence_tier=_tier(corr, rep_hit, has_timing=True),
                 mitre_technique_id=_field(acc, "mitre_technique"),
+                accessed_object=(_field(acc, "object_path")
+                                 or _field(acc, "object_name")),
             ))
 
     if best_match:

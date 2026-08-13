@@ -71,17 +71,24 @@ class ProvenanceRecord:
     recovered_bytes: int = 0          # reconstructed exfil content size (D1)
     recovered_sha256: str | None = None
     recovered_preview: str | None = None
+    # The host-side item, named. `evidence` is the ON-THE-WIRE descriptor (an
+    # HTTP URI, a mail subject); this is what was read on the machine. Keeping
+    # them separate matters: one is what the malware sent, the other is what it
+    # took, and conflating them would overstate the link between the two.
+    accessed_object: str | None = None
 
     def statement(self) -> str:
         who = self.destination_domain or self.destination_ip
         via = f" via {self.accessed_via}" if self.accessed_via else ""
+        item = f"{self.item_type} {self.accessed_object}" if self.accessed_object \
+            else self.item_type
         if self.confidence_tier == "allowlisted":
             # Not an exfiltration claim. A sanctioned service received routine
             # traffic that happened to fall inside the correlation window after
             # a file read. Tagging the tier at the end of an "was exfiltrated"
             # sentence does not undo the accusation the sentence just made —
             # the verb itself has to change.
-            return (f"{self.item_type}{via} at {self.accessed_at} was read, and "
+            return (f"{item}{via} at {self.accessed_at} was read, and "
                     f"routine background traffic to {who} followed at "
                     f"{self.exfiltrated_at} (+{self.time_delta_s}s). {who} is a "
                     f"known-good service; no transfer of this item is claimed. "
@@ -91,7 +98,7 @@ class ProvenanceRecord:
         if self.recovered_bytes:
             recovered = (f" — recovered {self.recovered_bytes} B "
                          f"(sha256 {self.recovered_sha256[:12]}…)")
-        return (f"{self.item_type}{via} at {self.accessed_at} {verb} to "
+        return (f"{item}{via} at {self.accessed_at} {verb} to "
                 f"{who} over {self.exfil_protocol} at {self.exfiltrated_at} "
                 f"(+{self.time_delta_s}s) [{self.confidence_tier}]{recovered}")
 
@@ -170,6 +177,7 @@ def build_provenance(correlated, network_events: list[dict],
             exfiltrated_at=c.network_ts, time_delta_s=c.time_delta_s,
             evidence=descriptor, inferred=inferred,
             confidence_tier=tier,
+            accessed_object=getattr(c, "accessed_object", None),
             recovered_bytes=art.total_bytes if art else 0,
             recovered_sha256=art.sha256 if art else None,
             recovered_preview=art.preview if art else None))
