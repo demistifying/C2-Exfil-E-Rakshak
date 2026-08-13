@@ -732,6 +732,16 @@ def _evidence_refs(native_kind: str | None, row: dict, correlated_ctx=None) -> l
         obj = getattr(correlated_ctx, "accessed_object", None)
         if obj:
             ref["object_path"] = str(obj)
+        # Process context alongside the object. UMAT back-fills this whole set
+        # only while the reference is empty, so emitting the path alone would
+        # satisfy its guard and suppress the rest — a half-filled reference is
+        # worse than either producer owning it outright.
+        for key, attr in (("process", "accessed_process"),
+                          ("process_id", "accessed_process_id"),
+                          ("process_path", "accessed_process_path")):
+            value = getattr(correlated_ctx, attr, None)
+            if value is not None:
+                ref[key] = value
         refs.append(ref)
     return refs
 

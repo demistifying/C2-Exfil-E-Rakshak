@@ -49,6 +49,14 @@ class CorrelatedEvent:
     # "read file data" into "read C:\...\Edge\User Data\Login Data" in the
     # officer sentence — the difference between a log line and a finding.
     accessed_object: str | None = None
+    # Process context for the same access. Carried because UMAT's
+    # _restore_access_object() back-fills the whole set only while the reference
+    # is empty; populating just the path would satisfy its guard and silently
+    # suppress the rest. Emitting all of it keeps the evidence reference
+    # self-contained rather than half-filled by two producers.
+    accessed_process: str | None = None
+    accessed_process_id: int | None = None
+    accessed_process_path: str | None = None
 
 
 def _parse(ts) -> datetime:
@@ -134,6 +142,9 @@ def correlate(access_events: list[dict],
                 mitre_technique_id=_field(acc, "mitre_technique"),
                 accessed_object=(_field(acc, "object_path")
                                  or _field(acc, "object_name")),
+                accessed_process=_field(acc, "process"),
+                accessed_process_id=_field(acc, "process_id"),
+                accessed_process_path=_field(acc, "process_path"),
             ))
 
     if best_match:
