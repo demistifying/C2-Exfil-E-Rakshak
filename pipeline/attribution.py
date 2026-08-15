@@ -160,6 +160,40 @@ def attribute(ip: str, ja3_hash: str | None = None,
         reputation_hit=hit, reputation_source=source, reputation_note=note)
 
 
+def enrich_geo_fields(event: dict) -> None:
+    """Fill missing GeoLite2 fields on any event carrying a destination IP.
+
+    Detectors remain responsible for their behavioural and reputation fields,
+    but they must not each reimplement GeoIP projection. Eleven of the emitting
+    paths in build_network_events hardcoded geo_country/asn/asn_org to None
+    because they never needed a full Attribution object while constructing the
+    event — so DNS, resolved-destination, tunnelling and static-IOC findings all
+    reached the report with a blank country and network owner even when the
+    GeoLite2 databases were present and working.
+
+    That matters beyond cosmetics: "23.37.85.220" and
+    "23.37.85.220 - Akamai Technologies, India" are different findings to an
+    analyst, and the second is what distinguishes a CDN edge from a C2.
+
+    Existing non-empty values are authoritative and are never overwritten.
+
+    Upstreamed from UMAT's deployment patch
+    0001-universal-geolite-event-enrichment, which identified the gap. Keeping
+    it here rather than as a deployment patch means one implementation, and
+    lets the runtime go back to running this tree pristine.
+    """
+    ip = event.get("dst_ip")
+    fields = ("geo_country", "asn", "asn_org")
+    if not isinstance(ip, str) or not ip or all(event.get(f) for f in fields):
+        return
+    result = attribute(ip, ja3_hash=event.get("ja3_hash"), ja4=event.get("ja4"))
+    for field in fields:
+        if not event.get(field):
+            value = getattr(result, field, None)
+            if value:
+                event[field] = value
+
+
 def _registered_domain(domain: str) -> str:
     labels = domain.lower().rstrip(".").split(".")
     return ".".join(labels[-2:]) if len(labels) >= 2 else domain.lower()

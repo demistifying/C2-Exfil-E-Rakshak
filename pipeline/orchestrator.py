@@ -522,6 +522,16 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                     "static_note": f"C2 in binary{fam}, not observed on network (dormant)",
                 })
 
+    # --- GeoLite2 projection over every destination ---------------------------
+    # GeoLite2 applies to every destination IP, not only the detector paths that
+    # happened to need a full reputation object while constructing their event.
+    # Centralising it here stops valid public destinations reaching the report
+    # with blank country and network-owner fields. Runs before the allowlist so
+    # an allowlisted row still carries its attribution for review.
+    from attribution import enrich_geo_fields
+    for e in events:
+        enrich_geo_fields(e)
+
     # --- sanctioned-service allowlist ---
     # Down-tier WEAK findings to known-good endpoints (update/telemetry/OCSP) to
     # 'allowlisted' so they don't clutter review. Never touches confirmed/strong;
