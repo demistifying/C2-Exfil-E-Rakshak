@@ -73,6 +73,43 @@ class TestRealCapture:
         assert not _is_os_background("accounts.zoho.com")
 
 
+class TestAbusedServicesUnderBackgroundSuffixes:
+    """A broad suffix allowlist is a recall hole.
+
+    google.com, live.com and office.com are on the background list because that
+    is what suppresses the OS telemetry flood. But Drive, Apps Script, OneDrive
+    and Office mail are documented exfiltration channels sitting under exactly
+    those suffixes, and were being scored 0.0 as expected OS traffic.
+
+    It fails worst where the module matters most: under simulated_inetsim a DNS
+    name is the only surviving evidence of intent, so staging to Google Drive
+    produced no candidate at all.
+    """
+
+    ABUSED = ("drive.google.com", "docs.google.com", "script.google.com",
+              "storage.googleapis.com", "onedrive.live.com",
+              "outlook.office.com", "graph.microsoft.com")
+
+    @pytest.mark.parametrize("host", ABUSED)
+    def test_abused_service_survives_its_background_suffix(self, host):
+        assert not _is_os_background(host), host
+
+    @pytest.mark.parametrize("host", ABUSED)
+    def test_abused_service_becomes_a_candidate(self, host):
+        found = _findings([host])
+        assert found and found[0].confidence > 0, host
+
+    def test_genuine_os_noise_is_still_suppressed(self):
+        """The exception must not reopen the flood it was protecting against."""
+        for host in ("settings-win.data.microsoft.com", "v10.events.data.microsoft.com",
+                     "ctldl.windowsupdate.com", "clients2.google.com",
+                     "connectivitycheck.gstatic.com", "login.live.com"):
+            assert _is_os_background(host), host
+
+    def test_subdomains_of_an_abused_host_are_covered(self):
+        assert not _is_os_background("myfolder.drive.google.com")
+
+
 class TestCandidateSemantics:
     def test_resolution_is_a_candidate_not_a_verdict(self):
         """Same rule as beaconing: a lone signal never reaches strong/confirmed.

@@ -263,8 +263,44 @@ _OS_BACKGROUND_SUFFIXES = (
 )
 
 
+# Hosts that sit UNDER a background suffix but are documented exfiltration and
+# C2 channels. These must never be down-tiered as operating-system noise.
+#
+# The background list is deliberately broad — whole suffixes like google.com,
+# live.com and office.com — because that is what suppresses the telemetry flood.
+# The cost of that breadth is a recall hole: drive.google.com, script.google.com
+# and onedrive.live.com are all real exfil channels, and every one of them was
+# being scored 0.0 and presented as expected OS traffic.
+#
+# The hole is worst exactly where the module is most needed. Under
+# network_mode=simulated_inetsim a DNS name is the ONLY surviving evidence of
+# intent, so a sample staging data to Google Drive produced no candidate at all.
+#
+# Note the asymmetry this corrects: the connection-side allowlist
+# (allowlist.DEFAULT_DOMAINS) is a narrow FQDN list and never suppressed these.
+# Only the DNS path did.
+_ABUSED_SERVICE_HOSTS = (
+    # Google: Drive/Docs/Sheets staging, Apps Script as a C2 relay
+    "drive.google.com", "docs.google.com", "script.google.com",
+    "sites.google.com", "forms.google.com", "apps-apis.google.com",
+    "storage.googleapis.com", "sheets.googleapis.com", "drive.googleapis.com",
+    "firebasestorage.googleapis.com", "www.googleapis.com",
+    # Microsoft consumer/enterprise storage and mail
+    "onedrive.live.com", "api.onedrive.com", "storage.live.com",
+    "outlook.office.com", "outlook.office365.com", "graph.microsoft.com",
+)
+
+
+def _is_abused_service(domain: str) -> bool:
+    """True for a known-abused service host, whatever suffix it sits under."""
+    d = (domain or "").lower().rstrip(".")
+    return any(d == host or d.endswith("." + host) for host in _ABUSED_SERVICE_HOSTS)
+
+
 def _is_os_background(domain: str) -> bool:
     d = (domain or "").lower().rstrip(".")
+    if _is_abused_service(d):
+        return False        # exception wins over the broad suffix
     return any(d == suffix or d.endswith("." + suffix) for suffix in _OS_BACKGROUND_SUFFIXES)
 
 
