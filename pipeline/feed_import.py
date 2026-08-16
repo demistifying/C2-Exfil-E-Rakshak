@@ -1,9 +1,17 @@
 """
 feed_import.py — import threat-intel from abuse.ch CSV feeds into the local DB.
 
-Supports two feed formats:
-  * Feodo Tracker C2 IP blocklist (csv.gz from abuse.ch)
-  * URLhaus URL dump (csv.gz from abuse.ch)
+Supports three feed formats:
+  * ThreatFox C2 IOCs, indexed by malware family  <- the C2 feed
+  * Feodo Tracker C2 IP blocklist (Emotet/Dridex/QakBot/TrickBot/BazarLoader)
+  * URLhaus URL dump — payload DOWNLOAD locations, not C2
+
+The distinction matters. Feodo covers five botnet families; URLhaus lists where
+payloads are hosted. Neither indexes the C2 of a modern RAT, so a Remcos or
+AsyncRAT destination matched nothing and could never be corroborated into
+`confirmed`. ThreatFox is the feed that closes that gap, and because it is
+indexed by family the reputation note carries real attribution — "Remcos C2"
+rather than "malware_download".
 
 Designed for OFFLINE use: download the CSVs once (or on a connected machine),
 then run this importer air-gapped. The threat-intel DB schema and lookup
@@ -236,6 +244,82 @@ def import_urlhaus(csv_path: str, db_path: str = _REP_DB) -> int:
     return count
 
 
+def import_threatfox(csv_path: str, db_path: str = _REP_DB) -> int:
+    """Import abuse.ch ThreatFox — C2 infrastructure, indexed by family.
+
+    This is the feed this module actually needs, and the one it was missing.
+    Feodo Tracker covers only Emotet/Dridex/QakBot/TrickBot/BazarLoader (5 IPs in
+    the shipped snapshot), and URLhaus lists payload-DOWNLOAD URLs, not C2. So a
+    modern RAT — Remcos, AsyncRAT, AgentTesla, Lumma — matched nothing, and no
+    finding against its C2 could be corroborated into `confirmed`.
+
+    ThreatFox indexes live C2 by malware family, which also gives the reputation
+    note real attribution value: "Remcos C2" rather than "malware_download".
+
+    Format (CSV export):
+      first_seen_utc, ioc_id, ioc_value, ioc_type, threat_type, fk_malware,
+      malware_alias, malware_printable, last_seen_utc, confidence_level, ...
+
+    `ioc_value` for an ip:port IOC is "203.0.113.9:2404"; the port is dropped and
+    the address stored, because reputation is looked up per destination address.
+    The port is preserved in the note, since a RAT on its configured port is a
+    stronger match than the same host on 443.
+    """
+    if not os.path.exists(csv_path):
+        print(f"[!] File not found: {csv_path}")
+        return 0
+
+    conn = sqlite3.connect(db_path)
+    _ensure_schema(conn)
+    count = 0
+
+    with open(csv_path, encoding="utf-8", errors="replace") as f:
+        for row in csv.reader(f):
+            if not row or row[0].lstrip().startswith("#") or len(row) < 8:
+                continue
+            first_seen = row[0].strip().strip('" ')
+            value = row[2].strip().strip('" ')
+            ioc_type = row[3].strip().strip('" ').lower()
+            family = (row[7].strip().strip('" ')
+                      or row[5].strip().strip('" ') or "unknown")
+            if not value or value.lower() == "ioc_value":
+                continue
+
+            port = None
+            if ioc_type in ("ip:port", "ip_port") and ":" in value:
+                value, _, port = value.rpartition(":")
+                indicator_type = "ip"
+            elif ioc_type in ("domain", "hostname"):
+                indicator_type = "domain"
+            elif _is_ip_literal(value):
+                indicator_type = "ip"
+            else:
+                continue     # url / hash IOCs are out of scope for this table
+
+            value = value.strip().rstrip(".").lower()
+            if not value:
+                continue
+            # Same rule as URLhaus: never brand a shared host from a feed.
+            if indicator_type == "domain" and any(
+                    value == d or value.endswith("." + d)
+                    for d in _SHARED_HOSTING + _FEED_SELF_REFERENCE):
+                continue
+            if indicator_type == "ip" and not _is_ip_literal(value):
+                continue
+
+            note = f"{family} C2" + (f" (port {port})" if port else "")
+            conn.execute(
+                "INSERT OR REPLACE INTO bad_indicators "
+                "(value, source, note, indicator_type, last_seen) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (value, "abuse.ch/ThreatFox", note, indicator_type, first_seen))
+            count += 1
+
+    conn.commit()
+    conn.close()
+    return count
+
+
 def import_ja3_known_bad(db_path: str = _REP_DB) -> int:
     """Seed known-bad JA3 hashes into the threat-intel DB.
 
@@ -328,7 +412,9 @@ def refresh(directory: str, db_path: str = _REP_DB) -> dict:
     total = {}
     for p in sorted(glob.glob(os.path.join(directory, "*"))):
         name = os.path.basename(p).lower()
-        if name.startswith("feodo"):
+        if name.startswith("threatfox"):
+            total[name] = import_threatfox(p, db_path)
+        elif name.startswith("feodo"):
             total[name] = import_feodo(p, db_path)
         elif name.startswith("urlhaus"):
             total[name] = import_urlhaus(p, db_path)
@@ -346,6 +432,7 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python pipeline/feed_import.py feodo <csv>")
         print("  python pipeline/feed_import.py urlhaus <csv>")
+        print("  python pipeline/feed_import.py threatfox <csv>")
         print("  python pipeline/feed_import.py domains <list.txt>")
         print("  python pipeline/feed_import.py ja3 | ja4")
         print("  python pipeline/feed_import.py refresh <feed_dir>")
@@ -357,6 +444,8 @@ if __name__ == "__main__":
 
     if feed_type == "feodo":
         print(f"[*] Imported {import_feodo(arg or 'data/feodotracker.csv')} Feodo C2 IPs")
+    elif feed_type == "threatfox":
+        print(f"[*] Imported {import_threatfox(arg or 'data/feeds/threatfox.csv')} ThreatFox C2 indicators")
     elif feed_type == "urlhaus":
         print(f"[*] Imported {import_urlhaus(arg or 'data/urlhaus.csv')} URLhaus indicators")
     elif feed_type == "domains":
