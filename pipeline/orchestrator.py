@@ -492,6 +492,21 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
         for c in corr:
             is_ip = c.indicator.type == "ip"
             val = c.indicator.value
+            # Tier by HOW the indicator was extracted, not merely that it was.
+            # A decrypted family config naming its C2 is near-conclusive; a
+            # string scraped from the same binary is not evidence of anything on
+            # its own. Treating them alike put an XML namespace from an
+            # application manifest into an officer's IOC table at `strong`.
+            #
+            # A scraped string still earns promotion when it is OBSERVED on the
+            # wire -- that is corroboration, and it is the same rule this module
+            # applies everywhere else: the signal alone is a candidate, the
+            # signal plus independent confirmation is a finding.
+            from_config = c.indicator.from_config_extraction
+            observed_tier = "confirmed" if from_config else "strong"
+            dormant_tier = "strong" if from_config else "weak"
+            how = ("decrypted from the sample's configuration" if from_config
+                   else "found as a string inside the sample")
             if c.observed:
                 # Observed on the wire but no specific detector fired for it
                 # (e.g. a single contact, or a simulated responder we can't fully
@@ -501,25 +516,28 @@ def build_network_events(pcap_path: str, zeek_dir: str | None = None,
                     events.append({
                         "kind": "static_ioc",
                         "dst_ip": val if is_ip else "",
-                        "dst_port": 0, "timestamp": dns_ts, "confidence": 0.9,
+                        "dst_port": 0, "timestamp": dns_ts,
+                        "confidence": 0.9 if from_config else 0.7,
                         "reputation_hit": True, "geo_country": None, "asn": None,
                         "asn_org": None,
                         "destination_domain": None if is_ip else val,
                         "ja3_hash": None, "plaintext_available": False,
-                        "confidence_tier": "confirmed",
-                        "static_match": f"static-extracted C2{fam} contacted on network",
+                        "confidence_tier": observed_tier,
+                        "static_match": (f"C2{fam} {how} and contacted on network"),
                     })
             else:
                 events.append({
                     "kind": "static_ioc",
                     "dst_ip": val if is_ip else "",
-                    "dst_port": 0, "timestamp": dns_ts, "confidence": 0.8,
+                    "dst_port": 0, "timestamp": dns_ts,
+                    "confidence": 0.8 if from_config else 0.4,
                     "reputation_hit": False, "geo_country": None, "asn": None,
                     "asn_org": None,
                     "destination_domain": None if is_ip else val,
                     "ja3_hash": None, "plaintext_available": False,
-                    "confidence_tier": "strong",
-                    "static_note": f"C2 in binary{fam}, not observed on network (dormant)",
+                    "confidence_tier": dormant_tier,
+                    "static_note": (f"Address{fam} {how}; not observed on the "
+                                    f"network (dormant)"),
                 })
 
     # --- GeoLite2 projection over every destination ---------------------------

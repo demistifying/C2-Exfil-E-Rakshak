@@ -47,10 +47,40 @@ import os
 VALID_TYPES = frozenset({"ip", "domain", "url", "email", "hash"})
 
 
+# Extraction methods that decrypt or parse a malware CONFIGURATION. An
+# indicator from one of these is the sample's own declared C2, and deserves the
+# weight the static prior has always given it.
+_CONFIG_EXTRACTION_SOURCES = ("cape_config", "config_extractor", "malware_config")
+
+
 @dataclass
 class StaticIndicator:
     type: str
     value: str
+    # How this indicator was obtained. WinST/DT and UMAT label it
+    # ("cape_config" from the family extractor, "cape_static_string" and
+    # "cape_report_strings" from scraping the binary) and this module used to
+    # discard the label and treat all of them alike.
+    source: str | None = None
+    evidence_origin: str | None = None
+
+    @property
+    def from_config_extraction(self) -> bool:
+        """True when a config extractor produced this, not a string scrape.
+
+        The distinction is the difference between a finding and an embarrassment.
+        A decrypted Remcos config naming its C2 is near-conclusive. A string
+        lifted out of the same binary is not: on the Remcos run this module
+        emitted `http://schemas.microsoft.com/SMI/2005/WindowsSettings` -- an XML
+        namespace from the application manifest -- as a `strong` C2 indicator,
+        alongside `login.yahoo.com`, which is simply a string inside a password
+        viewer. Both were presented to an officer as C2 extracted from the binary.
+
+        Unknown provenance is treated as a scrape. A prior that does not say how
+        it found something has not earned the higher tier.
+        """
+        s = (self.source or "").lower()
+        return any(marker in s for marker in _CONFIG_EXTRACTION_SOURCES)
 
     def match_keys(self) -> set[str]:
         """The concrete strings this indicator could match against network
@@ -123,7 +153,11 @@ def ingest_prior(raw: dict, *, strict: bool = False) -> PriorReport:
             report.errors.append(msg); continue
         if not str(ind["value"]).strip():
             report.errors.append(f"c2_indicators[{i}] empty value"); continue
-        prior.indicators.append(StaticIndicator(ind["type"], str(ind["value"]).strip()))
+        prior.indicators.append(StaticIndicator(
+            ind["type"], str(ind["value"]).strip(),
+            source=(str(ind["source"]).strip() if ind.get("source") else None),
+            evidence_origin=(str(ind["evidence_origin"]).strip()
+                             if ind.get("evidence_origin") else None)))
     return report
 
 
